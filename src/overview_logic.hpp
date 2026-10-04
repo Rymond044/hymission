@@ -250,7 +250,8 @@ struct WorkspaceSwipeProgress {
 [[nodiscard]] std::vector<Rect>    layoutWorkspaceStripSlots(const Rect& stripBand, WorkspaceStripAnchor anchor, std::size_t slotCount, double gap);
 [[nodiscard]] std::vector<Rect>    layoutNiriWorkspaceStripSlots(const Rect& stripBand, WorkspaceStripAnchor anchor, std::size_t slotCount,
                                                                   std::optional<std::size_t> activeIndex, double gap, double padding,
-                                                                  double workspaceAspectRatio, double workspaceScale = 1.0);
+                                                                  double workspaceAspectRatio, double workspaceScale = 1.0,
+                                                                  bool alwaysCenterActive = false);
 [[nodiscard]] std::optional<std::size_t> hitTestWorkspaceStrip(const std::vector<Rect>& rects, double x, double y);
 [[nodiscard]] std::string normalizedSearchText(std::string_view value);
 [[nodiscard]] bool        windowMatchesSearch(std::string_view title, std::string_view windowClass, std::string_view normalizedQuery);

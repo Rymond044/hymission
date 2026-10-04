@@ -652,6 +652,15 @@ int main() {
     ok &= expectRect(niriOverflowSlots[3], {186, 8, 128, 64}, "niri overflowing strip should keep active slot centered");
     ok &= expectRect(niriOverflowSlots[5], {462, 8, 128, 64}, "niri overflowing strip should allow slots after the screen");
 
+    const auto niriEdgeClampedSlots =
+        layoutNiriWorkspaceStripSlots({0, 0, 500, 80}, WorkspaceStripAnchor::Top, 3, std::optional<std::size_t>{0}, 10, 8, 2.0);
+    ok &= expectRect(niriEdgeClampedSlots[0], {88, 8, 128, 64}, "niri fitting strip should clamp instead of centering an edge slot");
+
+    const auto niriAlwaysCenteredSlots =
+        layoutNiriWorkspaceStripSlots({0, 0, 500, 80}, WorkspaceStripAnchor::Top, 3, std::optional<std::size_t>{0}, 10, 8, 2.0, 1.0, true);
+    ok &= expectRect(niriAlwaysCenteredSlots[0], {186, 8, 128, 64}, "always-centered strip should center an edge slot even when all slots fit");
+    ok &= expectRect(niriAlwaysCenteredSlots[2], {462, 8, 128, 64}, "always-centered strip may push trailing slots past the band");
+
     ok &= expect(hitTestWorkspaceStrip(topSlots, 120, 10) == std::optional<std::size_t>{1}, "strip hit-test should find the matching slot");
     ok &= expect(!hitTestWorkspaceStrip(topSlots, 100, 10).has_value(), "strip hit-test should miss strip gaps");
 

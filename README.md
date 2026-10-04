@@ -754,6 +754,8 @@ existing `workspace_strip_*` options continue to control overview only.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `workspace_strip_anchor` | string | `left` | Strip anchor. Supports `top`, `left`, and `right`. |
+| `workspace_strip_center_active` | bool | `0` | With `niri_mode = 1`, always keep the active workspace at the strip center (edge slots may extend past the screen) instead of clamping the strip to its ends. Switching workspaces scrolls the strip in lockstep with the content transition, including trackpad swipes. |
+| `workspace_strip_keyboard_nav` | bool | `0` | In `onlycurrentworkspace` overview, arrow keys (and `h/l` or `j/k` with `vim_keys`) continue into the neighbouring strip workspace when there is no window further in that direction; `Return` with no window selected leaves the overview on the current workspace. Stops at the strip ends and never steps onto the new-workspace slot. |
 | `workspace_strip_empty_mode` | string | `existing` | Empty-workspace strip policy. `existing` only shows real workspaces; `continuous` inserts the next missing numbered workspace in each positive-id gap without expanding named-workspace spans. |
 | `workspace_strip_force_show` | bool | `0` | Show the workspace strip in all overview scopes, including `forceall`. Internal thumbnail previews still suppress the strip. |
 | `workspace_strip_thickness` | int | `160` | Strip thickness. |
