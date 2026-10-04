@@ -529,7 +529,7 @@ workspace thumbnail. Group order, membership, and lock state are preserved.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `vim_keys` | bool | `0` | Use `h/j/k/l` to move left/down/up/right. Forces keyboard pick labels off and shows a warning, regardless of `pick_labels_enabled`. Overview opens ready for navigation; press `/` to search. |
+| `vim_keys` | bool | `0` | Use `h/j/k/l` to move left/down/up/right. Forces keyboard pick labels off and shows a warning (unless `info_notifications = 0`), regardless of `pick_labels_enabled`. Overview opens ready for navigation; press `/` to search. |
 
 Outside search, `Tab` and `Shift+Tab` cycle the selection in the same order the mouse wheel uses, independent of
 `vim_keys`. `Return` activates the selection and `Escape` closes overview.
@@ -765,6 +765,7 @@ This keeps normal workspace names untouched outside overview. While overview is 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `debug_logs` | bool | `0` | Enable overview debug logging. |
+| `info_notifications` | bool | `1` | Show informational notifications (empty-overview collection summary, `vim_keys` pick-label notice). Errors and warnings are always shown. |
 | `debug_surface_logs` | bool | `0` | Enable more verbose surface-level debug logging. |
 
 ## Development

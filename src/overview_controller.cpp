@@ -5236,6 +5236,10 @@ bool OverviewController::debugLogsEnabled() const {
     return getConfigInt(m_handle, "plugin:hymission:debug_logs", 0) != 0;
 }
 
+bool OverviewController::infoNotificationsEnabled() const {
+    return getConfigInt(m_handle, "plugin:hymission:info_notifications", 1) != 0;
+}
+
 bool OverviewController::gestureCloseRestoresFocus() const {
     return getConfigInt(m_handle, "plugin:hymission:gesture_close_restores_focus", 1) != 0;
 }
@@ -11053,7 +11057,8 @@ void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requ
         (expandSelectedWindowEnabled() ? Desktop::focusState()->window() : PHLWINDOW{});
     State next = buildState(monitor, requestedScope, workspaceOverrides, false, false, layoutSelectedWindow);
     if (next.windows.empty() && next.stripEntries.empty()) {
-        notify(collectionSummary(monitor), CHyprColor(1.0, 0.7, 0.2, 1.0), 5000);
+        if (infoNotificationsEnabled())
+            notify(collectionSummary(monitor), CHyprColor(1.0, 0.7, 0.2, 1.0), 5000);
         return;
     }
 
@@ -12577,6 +12582,8 @@ void OverviewController::warnAboutVimLabels() {
     if (m_vimLabelsWarned)
         return;
     m_vimLabelsWarned = true;
+    if (!infoNotificationsEnabled())
+        return;
     notify("[hymission] vim_keys is enabled: pick labels are forcibly disabled; press / to search",
            CHyprColor(1.0, 0.7, 0.2, 1.0), 8000);
 }
