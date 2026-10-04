@@ -6539,8 +6539,12 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
     if (target.participatingMonitors.empty())
         return false;
 
-    if (workspace)
+    if (workspace) {
         target.ownerWorkspace = workspace;
+        // buildState() laid the strip out around the monitor's current workspace;
+        // redo it so the committed strip marks (and centers) the target instead.
+        buildWorkspaceStripEntries(target);
+    }
 
     target.phase = Phase::Active;
     target.focusBeforeOpen = m_state.focusBeforeOpen;
@@ -6924,12 +6928,36 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
         m_state = std::move(next);
         applyWorkspaceNameOverrides(m_state);
         refreshWorkspaceStripSnapshots();
-        if (const auto focused = Desktop::focusState()->window()) {
+        const auto focused = Desktop::focusState()->window();
+        bool       focusedOnTarget = false;
+        if (focused) {
             const auto focusedIt =
                 std::find_if(m_state.windows.begin(), m_state.windows.end(), [&](const ManagedWindow& managed) { return managed.window == focused; });
             if (focusedIt != m_state.windows.end()) {
                 m_state.selectedIndex = static_cast<std::size_t>(std::distance(m_state.windows.begin(), focusedIt));
                 m_state.focusDuringOverview = focused;
+                focusedOnTarget = true;
+            }
+        }
+
+        // The workspace was switched with noFocus, so the compositor may still focus a
+        // window on the workspace we left. Left alone, closing (now or on a later open)
+        // restores that window and jumps back to the original workspace.
+        if (!focusedOnTarget && m_state.collectionPolicy.onlyActiveWorkspace) {
+            if (!m_state.windows.empty()) {
+                std::size_t index = 0;
+                if (const auto last = targetWorkspace->getLastFocusedWindow()) {
+                    const auto lastIt =
+                        std::find_if(m_state.windows.begin(), m_state.windows.end(), [&](const ManagedWindow& managed) { return managed.window == last; });
+                    if (lastIt != m_state.windows.end())
+                        index = static_cast<std::size_t>(std::distance(m_state.windows.begin(), lastIt));
+                }
+                m_state.selectedIndex = index;
+                syncFocusDuringOverviewFromSelection(false, "workspace-transition-commit");
+            } else if (focused && !focused->m_pinned && focused->m_workspace && focused->m_workspace != targetWorkspace &&
+                       focused->m_workspace->m_monitor.lock() == transitionMonitor) {
+                Desktop::focusState()->resetWindowFocus();
+                m_state.focusDuringOverview = {};
             }
         }
 
