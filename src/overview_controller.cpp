@@ -5240,6 +5240,14 @@ bool OverviewController::infoNotificationsEnabled() const {
     return getConfigInt(m_handle, "plugin:hymission:info_notifications", 1) != 0;
 }
 
+bool OverviewController::workspaceStripCenterActiveEnabled() const {
+    return getConfigInt(m_handle, "plugin:hymission:workspace_strip_center_active", 0) != 0;
+}
+
+bool OverviewController::workspaceStripKeyboardNavEnabled() const {
+    return getConfigInt(m_handle, "plugin:hymission:workspace_strip_keyboard_nav", 0) != 0;
+}
+
 bool OverviewController::gestureCloseRestoresFocus() const {
     return getConfigInt(m_handle, "plugin:hymission:gesture_close_restores_focus", 1) != 0;
 }
@@ -6571,6 +6579,8 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
     if (mode == WorkspaceTransitionMode::TimedCommit)
         m_workspaceTransition.animationToDelta = static_cast<double>(m_workspaceTransition.step) * m_workspaceTransition.distance;
 
+    m_workspaceTransition.stripShift = workspaceStripCenteringShift(monitor, workspaceId);
+
     armWorkspaceTransitionRenderState();
 
     if (debugLogsEnabled()) {
@@ -6765,6 +6775,7 @@ void OverviewController::updateOverviewWorkspaceTransition() {
         return;
 
     if (m_workspaceTransition.mode == WorkspaceTransitionMode::TimedRevert) {
+        m_closeAfterWorkspaceTransitionCommit = false;
         clearOverviewWorkspaceTransition();
         updateHoveredFromPointer(false, false, false, false, "workspace-transition-revert");
         damageOwnedMonitors();
@@ -6891,6 +6902,18 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
         next.phase = Phase::Active;
         next.focusBeforeOpen = m_state.focusBeforeOpen;
         next.pendingExitFocus = m_state.pendingExitFocus;
+        if (m_state.collectionPolicy.onlyActiveWorkspace && next.windows.empty()) {
+            // The pre-open focus lives on the workspace this monitor just left. Restoring
+            // it on close would switch straight back, making empty workspaces unreachable.
+            const auto leftBehind = [&](const PHLWINDOW& window) {
+                return window && window->m_workspace && window->m_workspace != targetWorkspace && !window->m_pinned &&
+                    window->m_workspace->m_monitor.lock() == transitionMonitor;
+            };
+            if (leftBehind(next.focusBeforeOpen))
+                next.focusBeforeOpen = {};
+            if (leftBehind(next.pendingExitFocus))
+                next.pendingExitFocus = {};
+        }
         next.closeMode = m_state.closeMode;
         next.relayoutActive = false;
         next.relayoutProgress = 1.0;
@@ -6929,6 +6952,12 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
         updateHoveredFromPointer(false, false, false, false, "workspace-transition-commit");
     }
     damageOwnedMonitors();
+
+    if (m_closeAfterWorkspaceTransitionCommit) {
+        m_closeAfterWorkspaceTransitionCommit = false;
+        const bool hasSelection = m_state.selectedIndex && *m_state.selectedIndex < m_state.windows.size();
+        beginClose(hasSelection ? CloseMode::ActivateSelection : CloseMode::Normal);
+    }
 }
 
 void OverviewController::armWorkspaceTransitionRenderState() {
@@ -8096,7 +8125,7 @@ std::vector<Rect> OverviewController::stripRects() const {
     rects.reserve(m_state.stripEntries.size());
 
     for (const auto& entry : m_state.stripEntries)
-        rects.push_back(animatedWorkspaceStripRect(entry.rect, entry.monitor));
+        rects.push_back(animatedWorkspaceStripEntryRect(entry, entry.monitor));
 
     return rects;
 }
@@ -9234,7 +9263,7 @@ std::optional<OverviewController::DragPreviewTarget> OverviewController::dragged
     if (m_state.hoveredStripIndex && *m_state.hoveredStripIndex < m_state.stripEntries.size()) {
         const auto& entry = m_state.stripEntries[*m_state.hoveredStripIndex];
         if (entry.monitor == monitor && (!entry.workspace || entry.workspace != window->m_workspace)) {
-            const Rect animatedArea = animatedWorkspaceStripRect(entry.rect, monitor);
+            const Rect animatedArea = animatedWorkspaceStripEntryRect(entry, monitor);
             std::optional<Rect> predictedPreview;
             if (entry.snapshot && entry.snapshot->dropPreview) {
                 if (entry.snapshot->dropPreviewRect && entry.rect.width > 0.0 && entry.rect.height > 0.0) {
@@ -9382,7 +9411,7 @@ double OverviewController::draggedPreviewTargetScaleForHover() const {
     if (!referenceEntry)
         return DRAG_PREVIEW_SCALE;
 
-    const Rect thumbnail = animatedWorkspaceStripRect(referenceEntry->rect, dragged.targetMonitor);
+    const Rect thumbnail = animatedWorkspaceStripEntryRect(*referenceEntry, dragged.targetMonitor);
     if (thumbnail.width <= 1.0)
         return DRAG_PREVIEW_SCALE;
 
@@ -9749,6 +9778,56 @@ Rect OverviewController::animatedWorkspaceStripRect(const Rect& rect, const PHLM
         return rect;
 
     return translateRect(rect, offset.x, offset.y);
+}
+
+Rect OverviewController::animatedWorkspaceStripEntryRect(const WorkspaceStripEntry& entry, const PHLMONITOR& monitor) const {
+    const Rect rect   = animatedWorkspaceStripRect(entry.rect, monitor);
+    const auto scroll = workspaceStripScrollOffset(entry.monitor);
+    if (scroll.x == 0.0 && scroll.y == 0.0)
+        return rect;
+
+    return translateRect(rect, scroll.x, scroll.y);
+}
+
+Vector2D OverviewController::workspaceStripScrollOffset(const PHLMONITOR& monitor) const {
+    if (!monitor || !m_workspaceTransition.active || m_workspaceTransition.monitor != monitor)
+        return {};
+
+    const auto& shift = m_workspaceTransition.stripShift;
+    if (shift.x == 0.0 && shift.y == 0.0)
+        return {};
+
+    // Follow the workspace transition itself, so the strip moves in lockstep with
+    // the content for timed switches, trackpad swipes and reverted swipes alike.
+    const double span = static_cast<double>(m_workspaceTransition.step) * m_workspaceTransition.distance;
+    if (std::abs(span) < 0.0001)
+        return {};
+
+    const double fraction = std::clamp(m_workspaceTransition.delta / span, 0.0, 1.0);
+    return Vector2D{shift.x * fraction, shift.y * fraction};
+}
+
+Vector2D OverviewController::workspaceStripCenteringShift(const PHLMONITOR& monitor, WORKSPACEID workspaceId) const {
+    if (!monitor || !niriModeEnabled() || !workspaceStripCenterActiveEnabled())
+        return {};
+
+    const WorkspaceStripEntry* activeEntry = nullptr;
+    const WorkspaceStripEntry* targetEntry = nullptr;
+    for (const auto& entry : m_state.stripEntries) {
+        if (entry.monitor != monitor)
+            continue;
+        if (entry.active && !activeEntry)
+            activeEntry = &entry;
+        if (entry.workspaceId == workspaceId && !targetEntry)
+            targetEntry = &entry;
+    }
+
+    if (!activeEntry || !targetEntry)
+        return {};
+
+    // The active slot sits at the strip center, so moving the target slot onto it
+    // is exactly the scroll the rebuilt (re-centered) strip will have after commit.
+    return Vector2D{activeEntry->rect.x - targetEntry->rect.x, activeEntry->rect.y - targetEntry->rect.y};
 }
 
 double OverviewController::relayoutVisualProgress() const {
@@ -11222,6 +11301,7 @@ void OverviewController::beginClose(CloseMode mode, std::optional<double> fromVi
         return;
 
     cancelAndClearTimer(m_stripRefreshTimer);
+    m_closeAfterWorkspaceTransitionCommit = false;
     const ScopedFlag beginCloseGuard(m_beginCloseInProgress);
     stopSearchInput(false);
     clearToggleSwitchSession();
@@ -12324,8 +12404,10 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
 }
 
 void OverviewController::moveSelection(Direction direction) {
-    if (m_state.windows.empty())
+    if (m_state.windows.empty()) {
+        (void)stepWorkspaceStripSelection(direction);
         return;
+    }
 
     if (!m_state.selectedIndex) {
         m_state.selectedIndex = 0;
@@ -12334,13 +12416,62 @@ void OverviewController::moveSelection(Direction direction) {
         return;
     }
 
-    if (const auto next = chooseDirectionalNeighbor(targetRects(), *m_state.selectedIndex, direction)) {
-        if (*next == *m_state.selectedIndex)
-            return;
-        m_state.selectedIndex = *next;
-        syncFocusDuringOverviewFromSelection(true, "keyboard-nav");
-        damageOwnedMonitors();
+    const auto next = chooseDirectionalNeighbor(targetRects(), *m_state.selectedIndex, direction);
+    if (!next || *next == *m_state.selectedIndex) {
+        // No window further that way: continue into the neighbouring strip workspace.
+        (void)stepWorkspaceStripSelection(direction);
+        return;
     }
+
+    m_state.selectedIndex = *next;
+    syncFocusDuringOverviewFromSelection(true, "keyboard-nav");
+    damageOwnedMonitors();
+}
+
+bool OverviewController::stepWorkspaceStripSelection(Direction direction) {
+    if (!workspaceStripKeyboardNavEnabled() || !allowsWorkspaceSwitchInOverview() || m_state.phase != Phase::Active || m_workspaceTransition.active ||
+        m_gestureSession.active)
+        return false;
+
+    int step = 0;
+    if (workspaceStripAnchor() == "top")
+        step = direction == Direction::Left ? -1 : direction == Direction::Right ? 1 : 0;
+    else
+        step = direction == Direction::Up ? -1 : direction == Direction::Down ? 1 : 0;
+    if (step == 0)
+        return false;
+
+    PHLMONITOR monitor = Desktop::focusState()->monitor();
+    if (!monitor || !containsHandle(m_state.participatingMonitors, monitor))
+        monitor = m_state.ownerMonitor;
+    if (!monitor)
+        return false;
+
+    std::optional<std::size_t> activeIndex;
+    for (std::size_t index = 0; index < m_state.stripEntries.size(); ++index) {
+        if (m_state.stripEntries[index].monitor == monitor && m_state.stripEntries[index].active) {
+            activeIndex = index;
+            break;
+        }
+    }
+    if (!activeIndex)
+        return false;
+
+    // A monitor's strip entries are contiguous and ordered along the strip. Stop at
+    // the ends instead of wrapping, and never step onto the "new workspace" slot.
+    const auto count = static_cast<std::ptrdiff_t>(m_state.stripEntries.size());
+    for (std::ptrdiff_t index = static_cast<std::ptrdiff_t>(*activeIndex) + step; index >= 0 && index < count; index += step) {
+        const auto& entry = m_state.stripEntries[static_cast<std::size_t>(index)];
+        if (entry.monitor != monitor || entry.newWorkspaceSlot)
+            break;
+        if (entry.specialWorkspace)
+            continue;
+
+        activateStripTarget(static_cast<std::size_t>(index));
+        return true;
+    }
+
+    return false;
 }
 
 bool OverviewController::moveSelectionCircular(int step, const char* source) {
@@ -12361,8 +12492,18 @@ bool OverviewController::moveSelectionCircular(int step, const char* source) {
 }
 
 void OverviewController::activateSelection() {
-    if (!m_state.selectedIndex || *m_state.selectedIndex >= m_state.windows.size())
+    const bool stripKeyboardNav = workspaceStripKeyboardNavEnabled() && allowsWorkspaceSwitchInOverview();
+    if (stripKeyboardNav && m_workspaceTransition.active) {
+        // Let the strip switch land first, then leave onto that workspace.
+        m_closeAfterWorkspaceTransitionCommit = true;
         return;
+    }
+
+    if (!m_state.selectedIndex || *m_state.selectedIndex >= m_state.windows.size()) {
+        if (stripKeyboardNav)
+            beginClose(CloseMode::Normal);
+        return;
+    }
 
     beginClose(CloseMode::ActivateSelection);
 }
@@ -13983,7 +14124,7 @@ void OverviewController::renderWorkspaceStrip() const {
             return dragged.window && dragged.targetMonitor == entry.monitor && (!entry.workspace || entry.workspace != dragged.window->m_workspace);
         }();
         const bool dropAffected = dropAnimationMatchesEntry(entry);
-        const Rect outerGlobal = animatedWorkspaceStripRect(entry.rect, renderMonitor);
+        const Rect outerGlobal = animatedWorkspaceStripEntryRect(entry, renderMonitor);
         const Rect outer = rectToMonitorLocal(outerGlobal, renderMonitor);
         if (outer.width <= 0.0 || outer.height <= 0.0)
             continue;
@@ -14189,7 +14330,8 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
             const double aspect = monitor->m_size.y > 0.0 ? static_cast<double>(monitor->m_size.x) / static_cast<double>(monitor->m_size.y) : (16.0 / 9.0);
             const double scale = niriWorkspaceScale();
             const auto slots =
-                layoutNiriWorkspaceStripSlots(band, parseWorkspaceStripAnchor(anchor), monitorEntries.size(), activeIndex, stripGap, padding, aspect, scale);
+                layoutNiriWorkspaceStripSlots(band, parseWorkspaceStripAnchor(anchor), monitorEntries.size(), activeIndex, stripGap, padding, aspect, scale,
+                                              workspaceStripCenterActiveEnabled());
             for (std::size_t index = 0; index < std::min(slots.size(), monitorEntries.size()); ++index) {
                 monitorEntries[index].rect = slots[index];
             }

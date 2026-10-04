@@ -417,6 +417,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     COLOR_CONF("close_button_glyph_color", 0xfaffffffLL);
     INT_CONF("debug_logs", 0);
     INT_CONF("info_notifications", 1);
+    INT_CONF("workspace_strip_center_active", 0);
+    INT_CONF("workspace_strip_keyboard_nav", 0);
     INT_CONF("gesture_close_restores_focus", 1);
     INT_CONF("debug_surface_logs", 0);
     STRING_CONF("layout_engine", "grid");

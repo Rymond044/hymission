@@ -440,6 +440,8 @@ class OverviewController {
         double                                 animationToDelta = 0.0;
         double                                 animationProgress = 0.0;
         std::chrono::steady_clock::time_point  animationStart = {};
+        // Strip scroll applied at full transition progress (centered strip mode).
+        Vector2D                               stripShift = {};
     };
 
     struct WorkspaceTransitionRenderStateBackup {
@@ -566,6 +568,8 @@ class OverviewController {
     [[nodiscard]] double       niriScrollingPreviewGap() const;
     [[nodiscard]] bool         debugLogsEnabled() const;
     [[nodiscard]] bool         infoNotificationsEnabled() const;
+    [[nodiscard]] bool         workspaceStripCenterActiveEnabled() const;
+    [[nodiscard]] bool         workspaceStripKeyboardNavEnabled() const;
     [[nodiscard]] bool         gestureCloseRestoresFocus() const;
     [[nodiscard]] bool         debugSurfaceLogsEnabled() const;
     [[nodiscard]] PHLWORKSPACE activeLayoutWorkspace() const;
@@ -746,6 +750,9 @@ class OverviewController {
     [[nodiscard]] double       workspaceStripEnterProgress() const;
     [[nodiscard]] Vector2D     workspaceStripEnterOffset(const PHLMONITOR& monitor) const;
     [[nodiscard]] Rect         animatedWorkspaceStripRect(const Rect& rect, const PHLMONITOR& monitor) const;
+    [[nodiscard]] Rect         animatedWorkspaceStripEntryRect(const WorkspaceStripEntry& entry, const PHLMONITOR& monitor) const;
+    [[nodiscard]] Vector2D     workspaceStripScrollOffset(const PHLMONITOR& monitor) const;
+    [[nodiscard]] Vector2D     workspaceStripCenteringShift(const PHLMONITOR& monitor, WORKSPACEID workspaceId) const;
     [[nodiscard]] bool         transformBoxForWindow(const PHLWINDOW& window, const PHLMONITOR& monitor, CBox& box, bool scaled) const;
     [[nodiscard]] CRegion      transformRegionForWindow(const PHLWINDOW& window, const PHLMONITOR& monitor, const CRegion& region, bool scaled) const;
     [[nodiscard]] PHLWINDOW    resolveExitFocus(CloseMode mode) const;
@@ -864,6 +871,7 @@ class OverviewController {
     void renderPickLabels() const;
     void renderOutline(const Rect& rect, const CHyprColor& color, double thickness) const;
     void activateStripTarget(std::size_t index);
+    bool stepWorkspaceStripSelection(Direction direction);
     void clearStripWindowDragState();
     void clearPendingStripWorkspaceChange();
     [[nodiscard]] bool matchesPendingStripWorkspaceChange(const PHLWORKSPACE& workspace) const;
@@ -995,6 +1003,7 @@ class OverviewController {
     bool                     m_applyingWorkspaceTransitionCommit = false;
     bool                     m_applyingThumbnailNewWindowPlacement = false;
     bool                     m_rebuildVisibleStateAfterWorkspaceTransitionCommit = false;
+    bool                     m_closeAfterWorkspaceTransitionCommit = false;
     bool                     m_workspaceTransitionCommitScheduled = false;
     bool                     m_pendingWorkspaceTransitionCommitFollowGesture = false;
     std::size_t              m_workspaceTransitionCommitGeneration = 0;
