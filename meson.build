@@ -1,5 +1,5 @@
 project('hymission', 'cpp',
-  version: '0.10.0',
+  version: '0.12.0',
   default_options: ['buildtype=release'],
 )
 
@@ -34,9 +34,20 @@ src = [
   'src/stage_logic.cpp',
   'src/stage_controller.cpp',
   'src/stage_edge_effect.cpp',
+  'src/tiles_controller.cpp',
+  'src/hook_broker.cpp',
+  'src/tiles_logic.cpp',
 ]
 
 glib_dep = dependency('glib-2.0')
+
+broker_test = executable('hymission-hook-broker-test', 'tools/hook_broker_test.cpp', include_directories: include_directories('src'), install: false)
+test('hymission-hook-broker-test', broker_test)
+
+tiles_logic_test = executable('hymission-tiles-logic-test',
+  ['tools/tiles_logic_test.cpp', 'src/tiles_logic.cpp'],
+  include_directories: include_directories('src'), install: false)
+test('hymission-tiles-logic-test', tiles_logic_test)
 
 shared_module(meson.project_name(), src,
   dependencies: [
@@ -61,6 +72,7 @@ executable('hymission-layout-demo',
 
 mission_layout_test = executable('hymission-mission-layout-test',
   ['tools/mission_layout_test.cpp', 'src/mission_layout.cpp'],
+  cpp_args: ['-D_GLIBCXX_ASSERTIONS'],
   include_directories: include_directories('src'),
   install: false,
 )
@@ -93,7 +105,7 @@ overview_logic_test = executable('hymission-overview-logic-test',
   install: false,
 )
 
-test('hymission-overview-logic-test', overview_logic_test)
+test('hymission-overview-logic-test', overview_logic_test, timeout: 10)
 
 search_child_process_test = executable('hymission-search-child-process-test',
   'tools/search_child_process_test.cpp',
@@ -102,3 +114,45 @@ search_child_process_test = executable('hymission-search-child-process-test',
   install: false,
 )
 test('search-child-process-test', search_child_process_test, timeout: 10)
+
+private_debug_log_test = executable('hymission-private-debug-log-test',
+  'tools/private_debug_log_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-private-debug-log-test', private_debug_log_test, timeout: 10)
+
+input_guard_test = executable('hymission-input-guard-test',
+  'tools/input_guard_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-input-guard-test', input_guard_test)
+
+config_command_test = executable('hymission-config-command-test',
+  'tools/config_command_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-config-command-test', config_command_test)
+
+deferred_snapshot_test = executable('hymission-deferred-snapshot-test',
+  'tools/deferred_snapshot_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-deferred-snapshot-test', deferred_snapshot_test)
+
+search_focus_test = executable('hymission-search-focus-test',
+  'tools/search_focus_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-search-focus-test', search_focus_test, timeout: 5)
+
+state_json_test = executable('hymission-state-json-test',
+  'tools/state_json_test.cpp',
+  include_directories: include_directories('src'),
+  install: false,
+)
+test('hymission-state-json-test', state_json_test)

@@ -4,10 +4,133 @@
   "site_url": "https://gfhdhytghd.github.io/hymission/",
   "releases": [
     {
+      "tag": "v0.12.0-v0.57.0",
+      "version": "0.12.0",
+      "hyprland": "0.57.0",
+      "published_at": "2026-10-29T16:48:59Z",
+      "headline": "Hyprland 0.57, workspace tiles, natural layout by default and Stage that pushes scrolling layouts aside",
+      "sections": [
+        {
+          "title": "Hyprland 0.57",
+          "items": [
+            "Targets the latest official Hyprland release, v0.57.0. For Hyprland's development main, use the hyprland-master branch.",
+            "The plugin refuses to load, with a notification, when the Hyprland headers it was built with do not match the running compositor; rebuild it for that compositor (`hyprpm update`).",
+            "Hooked compositor functions are checked against their exact 0.57 signatures at build time."
+          ]
+        },
+        {
+          "title": "Workspace tiles (opt-in)",
+          "items": [
+            "Split a monitor into up to three independent workspace tiles with `tiles_enabled = 1`. Each tile keeps its own active workspace and history; focus, fullscreen and maximize stay inside the owning tile.",
+            "Add, remove, focus and resize tiles with `hl.plugin.hymission.tile_*`, or drag a tile boundary; Esc restores the starting widths.",
+            "Overview and the workspace strip group windows by tile, and Stage gets a sidebar per tile. Drag previews between tiles to move windows or split a desktop.",
+            "`tiles_state()`, `hyprctl -j hymission-tiles-state` and the `hymission-tiles` socket2 event expose tiles to bars."
+          ]
+        },
+        {
+          "title": "Natural layout by default",
+          "items": [
+            "The default `layout_engine` is now `natural`, using the former natural2 algorithm with stable allocations and workspace/column-aware packing. Set `layout_engine = \"grid\"` to keep the previous layout.",
+            "`natural2` remains an alias. The old natural solver has been removed; `natural_scale_flex` is accepted as a deprecated no-op.",
+            "Overview slots stay put when native focus resizes or rearranges the real windows; the selected and hovered enlargement pushes neighbours aside without swapping their order."
+          ]
+        },
+        {
+          "title": "Stage",
+          "items": [
+            "Dragging a workspace card to another slot in its sidebar column renumbers the real workspaces (`stage_drag_reorder`, on by default).",
+            "On scrolling layouts with several columns, opening Stage pushes the whole layout aside instead of resizing every window. A single window, or a maximized column, still narrows to fit the remaining desktop and returns to its width when Stage closes."
+          ]
+        },
+        {
+          "title": "Overview",
+          "items": [
+            "The window search box is a single opaque surface, and the search header space is always reserved.",
+            "New defaults: `niri_scrolling_preview_gap = 24`, `focus_selected_thickness = 3`, `backdrop_color = 0x26000000`."
+          ]
+        },
+        {
+          "title": "Fixed",
+          "items": [
+            "Unloading the plugin right after a config reload while the overview is open no longer crashes Hyprland: deferred work is owned and cancelled on unload.",
+            "`hyprctl reload full-reset` keeps Hymission's Lua functions and options.",
+            "Window shadows no longer fade out while the overview closes, and workspace strip thumbnails follow the live desktop.",
+            "Overview opacity follows native focus changes.",
+            "A continuous swipe from the overview through the desktop into the workspace overview no longer leaves a dimmed ghost window.",
+            "Overview initialization failures are reported instead of opening silently; invalid UTF-8 in window titles no longer breaks the state JSON; numeric options are validated."
+          ]
+        }
+      ]
+    },
+    {
+      "tag": "v0.11.0-v0.56.2",
+      "version": "0.11.0",
+      "hyprland": "0.56.2",
+      "published_at": "2026-10-11T21:39:11Z",
+      "headline": "Complete session-lock input safety, HDR Stage strips and steadier Stage clicks",
+      "sections": [
+        {
+          "title": "Session-lock input safety",
+          "items": [
+            "While the session is locked, every overview and Stage input listener and gesture hook yields to the lock screen: keyboard, pointer, touch, workspace swipes and custom gestures are no longer inspected or cancelled, so they all reach the locker.",
+            "Locking closes the overview immediately and cancels in-flight gestures, swipes, touch tracking, drags, Stage interactions and toggle polling without committing them; nothing stale resumes after unlocking.",
+            "Debug logs escape control characters in window titles, classes and workspace names."
+          ]
+        },
+        {
+          "title": "Stage",
+          "items": [
+            "After clicking a Stage card to switch workspaces, hover no longer recenters the scrolling layout while the pointer keeps moving right; the first leftward motion ends the guard. Set `stage_click_hover_recenter_guard = 0` to disable it."
+          ]
+        },
+        {
+          "title": "Fixed",
+          "items": [
+            "Workspace strip snapshots on HDR monitors keep FP16 precision, so thumbnails no longer clip or shift HDR colors."
+          ]
+        }
+      ]
+    },
+    {
+      "tag": "v0.10.2-v0.56.2",
+      "version": "0.10.2",
+      "hyprland": "0.56.2",
+      "published_at": "2026-10-11T19:57:09Z",
+      "headline": "Stop search input capture when the session locks",
+      "sections": [
+        {
+          "title": "Session-lock input safety",
+          "items": [
+            "Cancel active search on the session-lock event, discard queued keys and stop the helper focus timer and IPC channel.",
+            "Pass keyboard events through while locked before inspecting keyboard state or cancelling input. Guard overview input handling, search startup, focus retries and helper IPC against session lock.",
+            "Do not restart search or replay pending keys after unlocking; rebuild the visible overview without its previous search filter.",
+            "Verified with CMake and Meson builds, existing regression suites and static path review. Actual locker input and unlock behavior remain pending live validation."
+          ]
+        }
+      ]
+    },
+    {
+      "tag": "v0.10.1-v0.56.2",
+      "version": "0.10.1",
+      "hyprland": "0.56.2",
+      "published_at": "2026-10-11T19:08:56Z",
+      "headline": "Keep debug logs private to the current user",
+      "sections": [
+        {
+          "title": "Debug log privacy",
+          "items": [
+            "Move the separate debug log from shared `/tmp` to a validated, user-owned private `XDG_RUNTIME_DIR`, with no temporary-directory fallback.",
+            "Restrict the log to `0600` before writing, including existing files. Reject symbolic links, hard links, non-regular files and unsafe runtime directories. Handle interrupted and partial writes.",
+            "Document the sensitive desktop information in debug output and owner cleanup of logs created by older releases. Hyprland logger output is unchanged."
+          ]
+        }
+      ]
+    },
+    {
       "tag": "v0.10.0-v0.56.2",
       "version": "0.10.0",
       "hyprland": "0.56.2",
-      "published_at": "2026-10-11T07:59:41Z",
+      "published_at": "2026-10-11T08:00:35Z",
       "headline": "Stage framebuffer crash fixes and Omarchy integration",
       "sections": [
         {

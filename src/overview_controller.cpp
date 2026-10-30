@@ -1,5 +1,14 @@
+#include "hook_broker.hpp"
 #include "overview_controller.hpp"
+#include "hook_abi.hpp"
+#include "numeric_config.hpp"
+#include "overview_expansion.hpp"
+#include "search_geometry.hpp"
+#include "snapshot_framebuffer.hpp"
 #include "stage_controller.hpp"
+#include "tiles_controller.hpp"
+#include "hook_symbols.hpp"
+#include <linux/input-event-codes.h>
 
 #include <algorithm>
 #include <any>
@@ -30,7 +39,7 @@
 #include <unistd.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 
-#include "vendor/nlohmann/json.hpp"
+#include "state_json.hpp"
 
 #define private public
 #include <hyprland/src/layout/algorithm/tiled/scrolling/ScrollingAlgorithm.hpp>
@@ -46,6 +55,9 @@
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/view/Group.hpp>
+#include <hyprland/src/desktop/view/window/WindowGroupMembership.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/desktop/history/WorkspaceHistoryTracker.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/event/EventBus.hpp>
@@ -62,9 +74,11 @@
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/cursor/CursorManager.hpp>
-#include <hyprland/src/managers/KeybindManager.hpp>
+#include <hyprland/src/keybinds/Resolver.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
-#include <hyprland/src/managers/EventManager.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/ipc/s2/S2.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
@@ -76,22 +90,36 @@
 #include <hyprland/src/protocols/LayerShell.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/decorations/CHyprDropShadowDecoration.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprutils/math/Region.hpp>
 
 #include "overview_logic.hpp"
+#include "render_context.hpp"
+#include "decoration_gradient.hpp"
+#include "action_hooks.hpp"
+#include "private_debug_log.hpp"
+#include "input_guard.hpp"
+#include "config_command.hpp"
 
 extern char** environ;
 
 namespace hymission {
 
+
+bool sessionLocked() {
+    return sessionLocked(g_pSessionLockManager.get());
+}
+
 namespace {
 void searchHelperAnchor() {}
 
+std::size_t inputGeneration = 0;
+
 std::string searchHelperPath() {
     Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(&searchHelperAnchor), &info) && info.dli_fname) {
+    if (dladdr(hooks::target(&searchHelperAnchor), &info) && info.dli_fname) {
         std::filesystem::path sibling = std::filesystem::path(info.dli_fname).parent_path() / "hymission-search-input";
         if (access(sibling.c_str(), X_OK) == 0)
             return sibling.string();
@@ -115,8 +143,9 @@ class OverviewOverlayPassElement final : public IPassElement {
     OverviewOverlayPassElement(OverviewController* controller, const PHLMONITOR& monitor) : m_controller(controller), m_monitor(monitor) {
     }
 
-    std::vector<UP<IPassElement>> draw() override {
-        const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
+        RenderContextScope contextScope{ctx};
+        const auto renderMonitor = renderContext().m_data.pMonitor.lock();
         if (!m_controller || !renderMonitor)
             return {};
 
@@ -135,19 +164,19 @@ class OverviewOverlayPassElement final : public IPassElement {
         return {};
     }
 
-    bool needsLiveBlur() override {
+    bool needsLiveBlur(Render::CRenderContext& ctx) override {
         return false;
     }
 
-    bool needsPrecomputeBlur() override {
+    bool needsPrecomputeBlur(Render::CRenderContext& ctx) override {
         return false;
     }
 
-    bool undiscardable() override {
+    bool undiscardable(Render::CRenderContext& ctx) override {
         return true;
     }
 
-    std::optional<CBox> boundingBox() override {
+    std::optional<CBox> boundingBox(Render::CRenderContext& ctx) override {
         const auto monitor = m_monitor.lock();
         if (!monitor)
             return std::nullopt;
@@ -155,7 +184,7 @@ class OverviewOverlayPassElement final : public IPassElement {
         return CBox{{}, monitor->m_size};
     }
 
-    CRegion opaqueRegion() override {
+    CRegion opaqueRegion(Render::CRenderContext& ctx) override {
         return {};
     }
 
@@ -175,23 +204,24 @@ class OverviewOverlayPassElement final : public IPassElement {
 class OverviewShadowPassElement final : public IPassElement {
   public:
     OverviewShadowPassElement(CBox box, int round, float roundingPower, int range, CHyprColor color, float alpha,
-                              PHLWINDOW cutoutWindow = {}, CBox cutoutSource = {}, CBox cutoutTarget = {}, float cutoutRadius = 0) :
+                              PHLWINDOW cutoutWindow = {}, CBox cutoutSource = {}, CBox cutoutTarget = {}, float cutoutRadius = 0, std::optional<CBox> shadowClip = {}) :
         m_box(box), m_round(round), m_roundingPower(roundingPower), m_range(range), m_color(color), m_alpha(alpha),
-        m_cutoutWindow(cutoutWindow), m_cutoutSource(cutoutSource), m_cutoutTarget(cutoutTarget), m_cutoutRadius(cutoutRadius) {
+        m_cutoutWindow(cutoutWindow), m_cutoutSource(cutoutSource), m_cutoutTarget(cutoutTarget), m_cutoutRadius(cutoutRadius), m_shadowClip(shadowClip) {
     }
 
-    std::vector<UP<IPassElement>> draw() override {
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
+        RenderContextScope contextScope{ctx};
         if (!g_pHyprOpenGL || m_box.width < 1 || m_box.height < 1 || m_range <= 0 || m_alpha <= 0.001F)
             return {};
 
-        auto& state = g_pHyprRenderer->m_renderData;
+        auto& state = renderContext().m_data;
         const auto savedClip = state.clipBox;
         Hyprutils::Utils::CScopeGuard restoreClip{[&] { state.clipBox = savedClip; }};
         const auto window = m_cutoutWindow.lock();
         if (window && m_cutoutSource.w > 0 && m_cutoutSource.h > 0 && m_cutoutTarget.w > 0 && m_cutoutTarget.h > 0) {
             // The body keeps its Stage card crop; its outer shadow needs the
             // full output or the first expanding frame acquires straight cuts.
-            state.clipBox = CBox{Vector2D{}, state.pMonitor->m_transformedSize};
+            state.clipBox = m_shadowClip.value_or(CBox{Vector2D{}, state.pMonitor->m_transformedSize});
             const auto savedWindow = state.currentWindow;
             const auto savedModif = state.renderModif;
             Hyprutils::Utils::CScopeGuard restore{[&] { state.currentWindow = savedWindow; state.renderModif = savedModif; }};
@@ -210,18 +240,21 @@ class OverviewShadowPassElement final : public IPassElement {
             // while overview surfaces retain their displayed corner radius.
             const float nativeRadius = m_cutoutRadius / (state.pMonitor->m_scale * scale);
             StageController::withWindowRounding(window, nativeRadius, [&] {
-                g_pHyprOpenGL->renderRoundedShadow(nativeBox, m_round, m_roundingPower, m_range, m_color, m_alpha);
+                g_pHyprOpenGL->renderRoundedShadow(renderContext(), nativeBox, m_round, m_roundingPower, m_range,
+                    Config::CGradientValueData{m_color}, m_alpha, window->presentation().renderPresentation());
             });
         } else
-            g_pHyprOpenGL->renderRoundedShadow(m_box, m_round, m_roundingPower, m_range, m_color, m_alpha);
+            g_pHyprOpenGL->renderRoundedShadow(renderContext(), m_box, m_round, m_roundingPower, m_range,
+                Config::CGradientValueData{m_color}, m_alpha,
+                state.currentWindow ? state.currentWindow->presentation().renderPresentation() : Render::SWindowRenderPresentation{});
         return {};
     }
 
-    bool needsLiveBlur() override {
+    bool needsLiveBlur(Render::CRenderContext& ctx) override {
         return false;
     }
 
-    bool needsPrecomputeBlur() override {
+    bool needsPrecomputeBlur(Render::CRenderContext& ctx) override {
         return false;
     }
 
@@ -244,6 +277,7 @@ class OverviewShadowPassElement final : public IPassElement {
     CBox       m_cutoutSource;
     CBox       m_cutoutTarget;
     float      m_cutoutRadius = 0;
+    std::optional<CBox> m_shadowClip;
 };
 
 namespace {
@@ -257,7 +291,7 @@ constexpr auto   NATIVE_ANIMATION_DISABLE_DURATION = std::chrono::milliseconds(3
 constexpr double CLOSE_SETTLE_EPSILON = 0.75;
 constexpr std::size_t CLOSE_SETTLE_STABLE_FRAMES = 2;
 constexpr double BACKDROP_ALPHA = 0.42;
-constexpr double OUTLINE_THICKNESS = 4.0;
+constexpr double OUTLINE_THICKNESS = 3.0;
 constexpr double HOVER_THICKNESS = 2.0;
 constexpr double TITLE_PADDING = 12.0;
 constexpr double STRIP_CARD_PADDING = 0.0;
@@ -290,25 +324,23 @@ constexpr auto   HYPRBARS_PASS_ELEMENT_NAME = "CBarPassElement";
 constexpr auto   HYPRGLASS_PASS_ELEMENT_NAME = "CGlassPassElement";
 OverviewController* g_controller = nullptr;
 
-float overviewPreviewAlphaForWindow(const PHLWINDOW& window, bool revealGroupedWindow = false) {
+float overviewPreviewAlphaForWindow(const PHLWINDOW& window, bool revealGroupedWindow = false, bool withoutActive = false) {
     if (!window)
         return 0.0F;
 
-    if (revealGroupedWindow && window->m_group) {
-        float alpha = 1.0F;
-        for (uint8_t value = Desktop::View::WINDOW_ALPHA_FADE; value < Desktop::View::WINDOW_ALPHA_LAST; ++value) {
-            const auto type = static_cast<Desktop::View::eWindowAlpha>(value);
-            if (type == Desktop::View::WINDOW_ALPHA_FULLSCREEN || type == Desktop::View::WINDOW_ALPHA_LAYOUT)
-                continue;
-            alpha *= window->alphaValue(type);
-        }
-        return std::clamp(alpha, 0.0F, 1.0F);
+    // Fullscreen is compositor occlusion, not user opacity. Expanded group
+    // members also need their layout occlusion removed. Keep active opacity
+    // separate so focus/rule updates can be applied without re-sampling fade.
+    float alpha = 1.0F;
+    for (uint8_t value = Desktop::View::WINDOW_ALPHA_FADE; value < Desktop::View::WINDOW_ALPHA_LAST; ++value) {
+        const auto type = static_cast<Desktop::View::eWindowAlpha>(value);
+        if (type == Desktop::View::WINDOW_ALPHA_FULLSCREEN ||
+            (type == Desktop::View::WINDOW_ALPHA_LAYOUT && revealGroupedWindow && window->grouping().group()) ||
+            (type == Desktop::View::WINDOW_ALPHA_ACTIVE && withoutActive))
+            continue;
+        alpha *= window->presentation().alphaValue(type);
     }
-
-    // WINDOW_ALPHA_FULLSCREEN is compositor occlusion state, not user-facing
-    // opacity. Hidden siblings of a fullscreen/maximized window must become
-    // opaque again inside overview while fade/layout/rule alpha is preserved.
-    return std::clamp(window->alphaTotalWithout(Desktop::View::WINDOW_ALPHA_FULLSCREEN), 0.0F, 1.0F);
+    return std::clamp(alpha, 0.0F, 1.0F);
 }
 
 enum class GestureDispatcherKind : uint8_t {
@@ -341,19 +373,36 @@ bool isWindowFadingOut(const PHLWINDOW&) {
     return false;
 }
 
-void moveWindowToWorkspaceForThumbnailDrop(const PHLWINDOW& window, const PHLWORKSPACE& workspace) {
-    if (!window || !workspace || !window->m_workspace || !workspace->m_space || !window->layoutTarget())
+std::optional<TilesController::View> tileDesktopDropTarget(const PHLWINDOW& window, const PHLMONITOR& monitor, const Vector2D& pointer) {
+    auto* tiles=TilesController::get();
+    if (!window || !tiles || !tiles->enabled(monitor)) return {};
+    for (const auto& view:tiles->views(monitor))
+        if (view.workspace!=window->m_workspace && view.allocation.containsPoint(pointer)) return view;
+    return {};
+}
+
+void moveWindowToWorkspaceForThumbnailDrop(const PHLWINDOW& window, const PHLWORKSPACE& workspace, uint64_t targetTile=0) {
+    if (!window || !workspace || !window->m_workspace || !workspace->space() || !window->layoutTarget())
         return;
 
-    if (window->m_pinned && workspace->m_isSpecialWorkspace)
+    if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) && (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return;
 
     if (window->m_workspace == workspace)
         return;
 
+    if (auto* tiles=TilesController::get();tiles && tiles->available() && workspace->type()!=Workspace::eWorkspaceType::SPECIAL) {
+        const auto mon=workspace->m_monitor.lock();
+        std::vector<PHLWINDOW> members;
+        if (const auto group=window->grouping().group()) { for (const auto& ref:group->windows()) if (auto member=ref.lock()) members.push_back(member); }
+        else members.push_back(window);
+        (void)tiles->moveWindows(members,mon,targetTile?targetTile:tiles->preferredTile(workspace,mon),workspace);
+        return;
+    }
+
     const bool fullscreen = Fullscreen::controller()->isFullscreen(window);
     const auto fullscreenMode = Fullscreen::controller()->getFullscreenModes(window).internal;
-    const bool wasVisible = window->m_workspace->isVisible();
+    const bool wasVisible = window->m_workspace->visible();
     const auto targetMonitor = workspace->m_monitor.lock();
     const auto positionOnMonitor = window->position(Desktop::View::IGeometric::GEOMETRIC_GOAL) - (window->m_monitor ? window->m_monitor->m_position : Vector2D{});
 
@@ -363,18 +412,18 @@ void moveWindowToWorkspaceForThumbnailDrop(const PHLWINDOW& window, const PHLWOR
     window->moveToWorkspace(workspace);
     window->m_monitor = workspace->m_monitor;
 
-    if (window->m_isFloating && targetMonitor)
+    if (window->isFloating() && targetMonitor)
         window->layoutTarget()->setPositionGlobal(CBox{positionOnMonitor + targetMonitor->m_position, window->layoutTarget()->position().size()});
 
     window->updateToplevel();
     if (window->m_ruleApplicator)
         window->m_ruleApplicator->propertiesChanged(Desktop::Rule::RULE_PROP_ON_WORKSPACE);
-    window->uncacheWindowDecos();
+    window->presentation().uncacheDecorations();
 
-    if (window->m_group)
-        window->m_group->updateWorkspace(workspace);
+    if (window->grouping().group())
+        window->grouping().group()->updateWorkspace(workspace);
 
-    g_layoutManager->newTarget(window->layoutTarget(), workspace->m_space);
+    g_layoutManager->newTarget(window->layoutTarget(), workspace->space());
 
     if (fullscreen)
         Fullscreen::controller()->setFullscreenMode(window, fullscreenMode);
@@ -384,9 +433,9 @@ void moveWindowToWorkspaceForThumbnailDrop(const PHLWINDOW& window, const PHLWOR
         window->m_workspace->updateWindows();
     Desktop::globalWindowController()->updateSuspendedStates();
 
-    if (!wasVisible && window->m_workspace && window->m_workspace->isVisible()) {
-        window->alpha(Desktop::View::WINDOW_ALPHA_MOVE_FROM_WORKSPACE)->setValueAndWarp(0.F);
-        *window->alpha(Desktop::View::WINDOW_ALPHA_MOVE_FROM_WORKSPACE) = 1.F;
+    if (!wasVisible && window->m_workspace && window->m_workspace->visible()) {
+        window->presentation().alpha(Desktop::View::WINDOW_ALPHA_MOVE_FROM_WORKSPACE)->setValueAndWarp(0.F);
+        *window->presentation().alpha(Desktop::View::WINDOW_ALPHA_MOVE_FROM_WORKSPACE) = 1.F;
     }
 }
 
@@ -406,7 +455,7 @@ long getConfigInt(HANDLE handle, const char* name, long fallback) {
     return fallback;
 }
 
-double getConfigFloat(HANDLE handle, const char* name, double fallback) {
+double getConfigFloat(HANDLE handle, const char* name, double fallback, double minimum, double maximum) {
     (void)handle;
 
     const auto value = Config::mgr()->getConfigValue(name);
@@ -414,10 +463,10 @@ double getConfigFloat(HANDLE handle, const char* name, double fallback) {
         return fallback;
 
     if (*value.type == typeid(Config::FLOAT))
-        return static_cast<double>(**reinterpret_cast<Config::FLOAT* const*>(value.dataptr));
+        return finiteConfig(static_cast<double>(**reinterpret_cast<Config::FLOAT* const*>(value.dataptr)), fallback, minimum, maximum);
 
     if (*value.type == typeid(Config::INTEGER))
-        return static_cast<double>(**reinterpret_cast<Config::INTEGER* const*>(value.dataptr));
+        return finiteConfig(static_cast<double>(**reinterpret_cast<Config::INTEGER* const*>(value.dataptr)), fallback, minimum, maximum);
 
     return fallback;
 }
@@ -474,65 +523,12 @@ std::string getConfigString(HANDLE handle, const char* name, std::string fallbac
     return fallback;
 }
 
-std::string luaStringLiteral(const std::string& value) {
-    std::string out = "\"";
-    for (const char ch : value) {
-        if (ch == '\\' || ch == '"')
-            out += '\\';
-        out += ch;
-    }
-    out += '"';
-    return out;
-}
-
-std::string luaConfigExpression(const std::string& name, const std::string& value) {
-    std::vector<std::string> parts;
-    std::string              current;
-    for (const char ch : name) {
-        if (ch == ':' || ch == '.') {
-            if (!current.empty()) {
-                parts.push_back(current);
-                current.clear();
-            }
-            continue;
-        }
-
-        current += ch;
-    }
-
-    if (!current.empty())
-        parts.push_back(current);
-
-    if (parts.empty())
-        return {};
-
-    std::string expression = "hl.config({";
-    for (std::size_t i = 0; i + 1 < parts.size(); ++i)
-        expression += "[" + luaStringLiteral(parts[i]) + "] = {";
-
-    expression += "[" + luaStringLiteral(parts.back()) + "] = " + value;
-
-    for (std::size_t i = 0; i < parts.size(); ++i)
-        expression += "}";
-
-    expression += ")";
-    return expression;
-}
+ConfigCommandAdapter configCommands;
 
 std::string setConfigKeyword(const std::string& name, const std::string& value) {
-    const auto result = HyprlandAPI::invokeHyprctlCommand("keyword", name + " " + value);
-    if (result == "ok")
-        return {};
-
-    if (result != "keyword can't work with non-legacy parsers. Use eval.")
-        return result;
-
-    const auto expression = luaConfigExpression(name, value);
-    if (expression.empty())
-        return result;
-
-    const auto evalResult = HyprlandAPI::invokeHyprctlCommand("eval", expression);
-    return evalResult == "ok" ? std::string{} : evalResult;
+    return configCommands.set(name, value, [](const std::string& command, const std::string& args) {
+        return HyprlandAPI::invokeHyprctlCommand(command, args);
+    });
 }
 
 std::optional<uint32_t> parseSwitchReleaseKeycode(const std::string& value) {
@@ -566,26 +562,19 @@ std::string asciiLowerCopy(std::string value) {
 }
 
 LayoutEngine parseLayoutEngine(std::string value) {
-    value = asciiLowerCopy(std::move(value));
-    if (value == "natural" || value == "apple" || value == "apple-like" || value == "expose" || value == "mission-control")
-        return LayoutEngine::Natural;
-
-    if (value == "thumbnail" || value == "thumbnails")
-        return LayoutEngine::Thumbnail;
-
-    return LayoutEngine::Grid;
+    return parseOverviewLayoutEngine(value);
 }
 
 std::optional<uint32_t> switchReleaseModifierMask(const std::string& value) {
     const auto lowered = asciiLowerCopy(value);
     if (lowered == "shift" || lowered == "shift_l" || lowered == "shift_r")
-        return HL_MODIFIER_SHIFT;
+        return static_cast<uint32_t>(Input::HL_MODIFIER_SHIFT);
     if (lowered == "ctrl" || lowered == "control" || lowered == "control_l" || lowered == "control_r" || lowered == "ctrl_l" || lowered == "ctrl_r")
-        return HL_MODIFIER_CTRL;
+        return static_cast<uint32_t>(Input::HL_MODIFIER_CTRL);
     if (lowered == "alt" || lowered == "alt_l" || lowered == "alt_r")
-        return HL_MODIFIER_ALT;
+        return static_cast<uint32_t>(Input::HL_MODIFIER_ALT);
     if (lowered == "super" || lowered == "super_l" || lowered == "super_r" || lowered == "meta" || lowered == "meta_l" || lowered == "meta_r")
-        return HL_MODIFIER_META;
+        return static_cast<uint32_t>(Input::HL_MODIFIER_META);
 
     return std::nullopt;
 }
@@ -825,42 +814,24 @@ double swipeDistanceForDirection(const ITrackpadGesture::STrackpadGestureUpdate&
     });
 }
 
-bool shouldWrapWorkspaceIds(const WORKSPACEID targetId, const WORKSPACEID currentId) {
+bool shouldWrapWorkspaceIds(const WorkspaceKey targetId, const WorkspaceKey currentId) {
     static auto PWORKSPACEWRAPAROUND = CConfigValue<Hyprlang::INT>("animations:workspace_wraparound");
 
     if (!*PWORKSPACEWRAPAROUND)
         return false;
 
-    WORKSPACEID lowestID = INT64_MAX;
-    WORKSPACEID highestID = INT64_MIN;
+    WorkspaceKey lowestID = INT64_MAX;
+    WorkspaceKey highestID = INT64_MIN;
 
     for (const auto& workspace : workspaceStateWorkspaces()) {
-        if (!workspace || workspace->m_id < 0 || workspace->m_isSpecialWorkspace)
+        if (!workspace || workspaceKey(workspace) < 0 || (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
             continue;
 
-        lowestID = std::min(lowestID, workspace->m_id);
-        highestID = std::max(highestID, workspace->m_id);
+        lowestID = std::min(lowestID, workspaceKey(workspace));
+        highestID = std::max(highestID, workspaceKey(workspace));
     }
 
     return std::min(targetId, currentId) == lowestID && std::max(targetId, currentId) == highestID;
-}
-
-float animationMovePercent(std::string style) {
-    std::ranges::transform(style, style.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-
-    std::istringstream stream(style);
-    std::string        token;
-    float              movePercent = 100.F;
-    while (stream >> token) {
-        if (!token.empty() && token.back() == '%') {
-            try {
-                movePercent = std::stof(token.substr(0, token.size() - 1));
-            } catch (...) {
-            }
-        }
-    }
-
-    return movePercent;
 }
 
 Vector2D predictedWorkspaceAnimationOffset(HANDLE handle, const PHLMONITOR& monitor, const PHLWORKSPACE& workspace, bool left, bool incoming) {
@@ -908,7 +879,7 @@ Vector2D predictedWorkspaceAnimationOffset(HANDLE handle, const PHLMONITOR& moni
 }
 
 double clampUnit(double value) {
-    return std::clamp(value, 0.0, 1.0);
+    return finiteConfig(value, 1.0, 0.0, 1.0);
 }
 
 bool hasUsableWindowSize(const Vector2D& size) {
@@ -928,12 +899,7 @@ Rect translateRect(const Rect& rect, double dx, double dy) {
     return makeRect(rect.x + dx, rect.y + dy, rect.width, rect.height);
 }
 
-Rect scaleRectAroundCenter(const Rect& rect, double scale) {
-    const double clampedScale = std::max(0.0, scale);
-    const double width = rect.width * clampedScale;
-    const double height = rect.height * clampedScale;
-    return makeRect(rect.centerX() - width * 0.5, rect.centerY() - height * 0.5, width, height);
-}
+
 
 Rect clampRectInside(const Rect& rect, const Rect& bounds) {
     const double width = std::min(rect.width, bounds.width);
@@ -954,30 +920,11 @@ Rect clampRectInside(const Rect& rect, const Rect& bounds) {
     return makeRect(x, y, width, height);
 }
 
-bool rectFitsInsideBounds(const Rect& rect, const Rect& bounds, double epsilon = 0.5) {
-    return rect.x >= bounds.x - epsilon && rect.y >= bounds.y - epsilon && rect.x + rect.width <= bounds.x + bounds.width + epsilon &&
-        rect.y + rect.height <= bounds.y + bounds.height + epsilon;
-}
 
-double maxCenteredScaleForBounds(const Rect& rect, const Rect& bounds) {
-    if (rect.width <= 1.0 || rect.height <= 1.0)
-        return 1.0;
 
-    const double halfWidth = std::max(0.0, std::min(rect.centerX() - bounds.x, bounds.x + bounds.width - rect.centerX()));
-    const double halfHeight = std::max(0.0, std::min(rect.centerY() - bounds.y, bounds.y + bounds.height - rect.centerY()));
-    const double maxWidth = halfWidth * 2.0;
-    const double maxHeight = halfHeight * 2.0;
-    return std::max(1.0, std::min(maxWidth / rect.width, maxHeight / rect.height));
-}
 
-double maxCenteredScaleForPerSideGrowth(const Rect& rect, double maxGrowXPerSide, double maxGrowYPerSide) {
-    if (rect.width <= 1.0 || rect.height <= 1.0)
-        return 1.0;
 
-    const double scaleX = 1.0 + std::max(0.0, maxGrowXPerSide) * 2.0 / rect.width;
-    const double scaleY = 1.0 + std::max(0.0, maxGrowYPerSide) * 2.0 / rect.height;
-    return std::max(1.0, std::min(scaleX, scaleY));
-}
+
 
 struct EdgeMotionAffinity {
     double verticalEdge = 0.0;
@@ -1027,12 +974,12 @@ bool rectsOverlap(const Rect& lhs, const Rect& rhs) {
 }
 
 void emitWorkspaceActiveEvents(const PHLWORKSPACE& workspace) {
-    if (!workspace || workspace->m_isSpecialWorkspace)
+    if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return;
 
-    if (g_pEventManager) {
-        g_pEventManager->postEvent(SHyprIPCEvent{"workspace", workspace->m_name});
-        g_pEventManager->postEvent(SHyprIPCEvent{"workspacev2", std::format("{},{}", workspace->m_id, workspace->m_name)});
+    if (IPC::Socket2::sock()) {
+        IPC::Socket2::sock()->postEvent(IPC::Socket2::SEvent{"workspace", workspace->addressableName()});
+        IPC::Socket2::sock()->postEvent(IPC::Socket2::SEvent{"workspacev2", std::format("{},{}", workspace->addressableName(), workspace->displayName())});
     }
     Event::bus()->m_events.workspace.active.emit(workspace);
 }
@@ -1078,31 +1025,7 @@ Rect moveRectOutsideBoundsAlongDirection(const Rect& rect, const Rect& bounds, d
     return translateRect(rect, directionX * fallbackDistance, directionY * fallbackDistance);
 }
 
-std::optional<double> overlapExitDistanceAlongDirection(const Rect& moving, const Rect& obstacle, double dirX, double dirY) {
-    if (!rectsOverlap(moving, obstacle))
-        return 0.0;
 
-    std::optional<double> exitDistance;
-    const auto consider = [&](double candidate) {
-        if (candidate < 0.0)
-            return;
-        candidate += 0.5;
-        if (!exitDistance || candidate < *exitDistance)
-            exitDistance = candidate;
-    };
-
-    if (dirX > 0.001)
-        consider((obstacle.x + obstacle.width - moving.x) / dirX);
-    else if (dirX < -0.001)
-        consider((moving.x + moving.width - obstacle.x) / -dirX);
-
-    if (dirY > 0.001)
-        consider((obstacle.y + obstacle.height - moving.y) / dirY);
-    else if (dirY < -0.001)
-        consider((moving.y + moving.height - obstacle.y) / -dirY);
-
-    return exitDistance;
-}
 
 CBox toBox(const Rect& rect) {
     return {
@@ -1175,13 +1098,17 @@ struct FramebufferBlitRect {
 };
 
 std::optional<FramebufferBlitRect> rectToFramebufferBlitRect(const Rect& rect, const Vector2D& framebufferSize) {
-    const GLint framebufferWidth = std::max(1, static_cast<int>(std::lround(framebufferSize.x)));
-    const GLint framebufferHeight = std::max(1, static_cast<int>(std::lround(framebufferSize.y)));
+    if (!std::isfinite(rect.x) || !std::isfinite(rect.y) || !std::isfinite(rect.width) || !std::isfinite(rect.height) ||
+        !std::isfinite(framebufferSize.x) || !std::isfinite(framebufferSize.y) || framebufferSize.x < 1.0 || framebufferSize.y < 1.0 ||
+        framebufferSize.x > std::numeric_limits<GLint>::max() || framebufferSize.y > std::numeric_limits<GLint>::max())
+        return std::nullopt;
+    const GLint framebufferWidth = static_cast<GLint>(framebufferSize.x);
+    const GLint framebufferHeight = static_cast<GLint>(framebufferSize.y);
 
-    const GLint left = std::clamp(static_cast<GLint>(std::floor(rect.x)), 0, framebufferWidth);
-    const GLint right = std::clamp(static_cast<GLint>(std::ceil(rect.x + rect.width)), 0, framebufferWidth);
-    const GLint topFromTop = std::clamp(static_cast<GLint>(std::floor(rect.y)), 0, framebufferHeight);
-    const GLint bottomFromTop = std::clamp(static_cast<GLint>(std::ceil(rect.y + rect.height)), 0, framebufferHeight);
+    const GLint left = static_cast<GLint>(std::clamp(std::floor(rect.x), 0.0, static_cast<double>(framebufferWidth)));
+    const GLint right = static_cast<GLint>(std::clamp(std::ceil(rect.x + rect.width), 0.0, static_cast<double>(framebufferWidth)));
+    const GLint topFromTop = static_cast<GLint>(std::clamp(std::floor(rect.y), 0.0, static_cast<double>(framebufferHeight)));
+    const GLint bottomFromTop = static_cast<GLint>(std::clamp(std::ceil(rect.y + rect.height), 0.0, static_cast<double>(framebufferHeight)));
     const GLint bottom = framebufferHeight - bottomFromTop;
     const GLint top = framebufferHeight - topFromTop;
 
@@ -1197,7 +1124,8 @@ std::optional<FramebufferBlitRect> rectToFramebufferBlitRect(const Rect& rect, c
 }
 
 bool blitFramebufferRegion(Render::IFramebuffer& sourceFramebuffer, Render::IFramebuffer& targetFramebuffer, const Rect& sourceRect, const Rect& targetRect) {
-    if (!sourceFramebuffer.isAllocated() || !targetFramebuffer.isAllocated())
+    // GLES2 has no glBlitFramebuffer nor separate read/draw framebuffer targets.
+    if (legacyGLES2Renderer() || !sourceFramebuffer.isAllocated() || !targetFramebuffer.isAllocated())
         return false;
 
     const auto sourceBlitRect = rectToFramebufferBlitRect(sourceRect, sourceFramebuffer.m_size);
@@ -1247,31 +1175,31 @@ bool renderTextureIntoFramebuffer(const PHLMONITOR& monitor, const SP<Render::IF
     setTextureLinearFiltering(texture);
     setFramebufferLinearFiltering(*targetFramebuffer);
 
-    const bool previousBlockScreenShader = g_pHyprRenderer->m_renderData.blockScreenShader;
+    const bool previousBlockScreenShader = renderContext().m_data.blockScreenShader;
     CRegion     fakeDamage{0, 0, targetFramebuffer->m_size.x, targetFramebuffer->m_size.y};
     if (!g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, targetFramebuffer)) {
-        g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShader;
+        renderContext().m_data.blockScreenShader = previousBlockScreenShader;
         return false;
     }
 
     g_pHyprRenderer->setViewport(0, 0, static_cast<int>(std::lround(targetFramebuffer->m_size.x)),
                                  static_cast<int>(std::lround(targetFramebuffer->m_size.y)));
-    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    renderContext().m_data.blockScreenShader = true;
     // Match Hyprland's own arbitrary-size framebuffer path (getBackground):
     // export projection uses framebuffer-local coordinates and its damage must
     // not be transformed back into physical output orientation. Otherwise a
     // 90-degree output constrains the copy to a width/height-swapped scissor.
-    g_pHyprRenderer->m_renderData.fbSize = targetFramebuffer->m_size;
-    g_pHyprRenderer->m_renderData.transformDamage = false;
-    g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0.0, 0.0, 0.0, 0.0}}, fakeDamage);
+    renderContext().m_data.fbSize = targetFramebuffer->m_size;
+    renderContext().m_data.transformDamage = false;
+    g_pHyprRenderer->setProjectionType(renderContext(), Render::RPT_EXPORT);
+    g_pHyprRenderer->draw(renderContext(), CClearPassElement::SClearData{.color = CHyprColor{0.0, 0.0, 0.0, 0.0}}, fakeDamage);
     const auto previousTextureTransform = texture->m_transform;
     if (textureTransform)
         texture->m_transform = *textureTransform;
-    g_pHyprOpenGL->renderTexture(texture, destinationBox, {.a = 1.0F});
+    g_pHyprOpenGL->renderTexture(renderContext(), texture, destinationBox, {.a = 1.0F});
     texture->m_transform = previousTextureTransform;
     g_pHyprRenderer->endRender();
-    g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShader;
+    renderContext().m_data.blockScreenShader = previousBlockScreenShader;
     return true;
 }
 
@@ -1286,10 +1214,9 @@ SP<Render::IFramebuffer> normalizeMonitorFramebuffer(const PHLMONITOR& monitor, 
     const int width = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.x)));
     const int height = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.y)));
     auto normalized = createFramebuffer(name);
-    if (!normalized || !normalized->alloc(width, height))
+    if (!normalized || !allocateSnapshotFramebufferLike(*normalized, *sourceFramebuffer, width, height))
         return nullptr;
 
-    normalized->setImageDescription(monitor->workBufferImageDescription());
     setFramebufferLinearFiltering(*normalized);
     // Hyprland snapshots use the output's physical buffer dimensions. Convert
     // them back to transformed monitor space before logical crops or scaling.
@@ -1340,7 +1267,7 @@ GLuint compileShaderStage(GLenum type, const char* source) {
     glGetShaderInfoLog(shader, infoLogLength, nullptr, infoLog.data());
     glDeleteShader(shader);
     if (Log::logger)
-        Log::logger->log(Log::ERR, "[hymission] gaussian blur shader compile failed: " + infoLog);
+        LOG(Log::ERR, "[hymission] gaussian blur shader compile failed: " + infoLog);
     return 0;
 }
 
@@ -1348,6 +1275,8 @@ bool ensureGaussianBlurPipeline() {
     auto& pipeline = gaussianBlurPipeline();
     if (pipeline.ready)
         return true;
+    if (legacyGLES2Renderer())
+        return false; // the blur shaders are GLES 3.2
     if (pipeline.failed)
         return false;
     if (!g_pHyprRenderer)
@@ -1405,7 +1334,7 @@ void main() {
         std::string infoLog(std::max(1, infoLogLength), '\0');
         glGetProgramInfoLog(pipeline.program, infoLogLength, nullptr, infoLog.data());
         if (Log::logger)
-            Log::logger->log(Log::ERR, "[hymission] gaussian blur shader link failed: " + infoLog);
+            LOG(Log::ERR, "[hymission] gaussian blur shader link failed: " + infoLog);
         glDeleteProgram(pipeline.program);
         pipeline.program = 0;
         pipeline.failed = true;
@@ -1541,7 +1470,9 @@ bool buildBlurredProxyFramebuffers(const SP<Render::IFramebuffer>& sourceFramebu
     const int framebufferHeight = static_cast<int>(std::lround(sourceFramebuffer->m_size.y));
     auto      horizontalFramebuffer = createFramebuffer("hymission hidden strip horizontal blur");
     auto      verticalFramebuffer = createFramebuffer("hymission hidden strip vertical blur");
-    if (!horizontalFramebuffer || !verticalFramebuffer || !horizontalFramebuffer->alloc(framebufferWidth, framebufferHeight) || !verticalFramebuffer->alloc(framebufferWidth, framebufferHeight))
+    if (!horizontalFramebuffer || !verticalFramebuffer ||
+        !allocateSnapshotFramebufferLike(*horizontalFramebuffer, *sourceFramebuffer, framebufferWidth, framebufferHeight) ||
+        !allocateSnapshotFramebufferLike(*verticalFramebuffer, *sourceFramebuffer, framebufferWidth, framebufferHeight))
         return false;
     setFramebufferLinearFiltering(*horizontalFramebuffer);
     setFramebufferLinearFiltering(*verticalFramebuffer);
@@ -1591,12 +1522,12 @@ void expandRenderDamageToFullMonitor(const PHLMONITOR& monitor) {
         return;
 
     CRegion fullMonitorDamage{0.0, 0.0, monitor->m_transformedSize.x, monitor->m_transformedSize.y};
-    CRegion damage = g_pHyprRenderer->m_renderData.damage.copy();
+    CRegion damage = renderContext().m_data.damage.copy();
     damage.add(fullMonitorDamage);
-    CRegion finalDamage = g_pHyprRenderer->m_renderData.finalDamage.copy();
+    CRegion finalDamage = renderContext().m_data.finalDamage.copy();
     finalDamage.add(fullMonitorDamage);
-    g_pHyprRenderer->m_renderData.damage = damage;
-    g_pHyprRenderer->m_renderData.finalDamage = finalDamage;
+    renderContext().m_data.damage = damage;
+    renderContext().m_data.finalDamage = finalDamage;
 }
 
 Vector2D renderedWindowPosition(const PHLWINDOW& window, bool goal = false) {
@@ -1632,7 +1563,7 @@ Rect sceneGlobalRectForWindow(const PHLWINDOW& window, bool goal = false) {
         return {};
 
     Vector2D position = renderedWindowPosition(window, goal);
-    if (window->m_workspace && !window->m_pinned)
+    if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
         position += goal ? window->m_workspace->m_renderOffset->goal() : window->m_workspace->m_renderOffset->value();
 
     const Vector2D size = goal ? window->size(Desktop::View::IGeometric::GEOMETRIC_GOAL) : window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
@@ -1641,8 +1572,8 @@ Rect sceneGlobalRectForWindow(const PHLWINDOW& window, bool goal = false) {
 
 Rect renderGlobalRectForWindow(const PHLWINDOW& window, bool goal = false) {
     Rect rect = sceneGlobalRectForWindow(window, goal);
-    if (window && window->m_isFloating)
-        rect = translateRect(rect, window->m_floatingOffset.x, window->m_floatingOffset.y);
+    if (window && window->isFloating())
+        rect = translateRect(rect, window->presentation().floatingOffset().x, window->presentation().floatingOffset().y);
     return rect;
 }
 
@@ -1654,10 +1585,10 @@ Rect surfaceRenderGlobalRectForWindow(const PHLWINDOW& window) {
 }
 
 Layout::Tiled::CScrollingAlgorithm* scrollingAlgorithmForWorkspace(const PHLWORKSPACE& workspace) {
-    if (!workspace || !workspace->m_space)
+    if (!workspace || !workspace->space())
         return nullptr;
 
-    const auto algorithm = workspace->m_space->algorithm();
+    const auto algorithm = workspace->space()->algorithm();
     if (!algorithm || !algorithm->tiledAlgo())
         return nullptr;
 
@@ -1668,7 +1599,7 @@ bool isFloatingOverviewWindow(const PHLWINDOW& window) {
     if (!window)
         return false;
 
-    if (window->m_isFloating)
+    if (window->isFloating())
         return true;
 
     const auto target = window->layoutTarget();
@@ -1712,7 +1643,7 @@ struct ScrollingOverviewGeometry {
 };
 
 std::optional<ScrollingOverviewGeometry> scrollingOverviewTapeRowGeometryForWindow(const PHLWINDOW& window, const Rect& fallbackGlobal, double previewGap) {
-    if (!window || !window->m_workspace || !window->m_workspace->m_space)
+    if (!window || !window->m_workspace || !window->m_workspace->space())
         return std::nullopt;
 
     const auto target = window->layoutTarget();
@@ -1727,7 +1658,7 @@ std::optional<ScrollingOverviewGeometry> scrollingOverviewTapeRowGeometryForWind
     if (!targetData || targetData->layoutBox.width <= 1.0 || targetData->layoutBox.height <= 1.0)
         return std::nullopt;
 
-    const CBox workAreaBox = window->m_workspace->m_space->workArea();
+    const CBox workAreaBox = window->m_workspace->space()->workArea();
     if (workAreaBox.width <= 1.0 || workAreaBox.height <= 1.0)
         return std::nullopt;
 
@@ -1917,6 +1848,9 @@ class CHymissionTrackpadGesture final : public ITrackpadGesture {
     }
 
     void begin(const STrackpadGestureBegin& e) override {
+        if (sessionLocked())
+            return;
+        m_inputGeneration = inputGeneration;
         m_tracking = false;
         if (!g_controller || !e.swipe ||
             !g_controller->beginTrackpadGesture(m_dispatcher == GestureDispatcherKind::Open, m_scope, m_recommand, m_direction, *e.swipe, m_deltaScale))
@@ -1926,6 +1860,8 @@ class CHymissionTrackpadGesture final : public ITrackpadGesture {
     }
 
     void update(const STrackpadGestureUpdate& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (!m_tracking || !g_controller || !e.swipe)
             return;
 
@@ -1933,6 +1869,8 @@ class CHymissionTrackpadGesture final : public ITrackpadGesture {
     }
 
     void end(const STrackpadGestureEnd& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (!m_tracking || !g_controller)
             return;
 
@@ -1941,6 +1879,7 @@ class CHymissionTrackpadGesture final : public ITrackpadGesture {
     }
 
   private:
+    std::size_t                       m_inputGeneration = 0;
     GestureDispatcherKind             m_dispatcher;
     OverviewController::ScopeOverride m_scope = OverviewController::ScopeOverride::Default;
     bool                              m_recommand = false;
@@ -1953,18 +1892,26 @@ class CHymissionStageTrackpadGesture final : public ITrackpadGesture {
   public:
     explicit CHymissionStageTrackpadGesture(float scale) : m_scale(scale) {}
     void begin(const STrackpadGestureBegin& e) override {
+        if (sessionLocked())
+            return;
+        m_inputGeneration = inputGeneration;
         m_tracking = e.swipe && StageController::beginVisibilityGesture();
     }
     void update(const STrackpadGestureUpdate& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_tracking && e.swipe)
             StageController::updateVisibilityGesture(e.swipe->delta.x * m_scale);
     }
     void end(const STrackpadGestureEnd& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_tracking)
             StageController::endVisibilityGesture(!e.swipe || e.swipe->cancelled);
         m_tracking = false;
     }
   private:
+    std::size_t m_inputGeneration = 0;
     float m_scale = 1;
     bool m_tracking = false;
 };
@@ -1976,6 +1923,9 @@ class CHymissionWorkspaceTrackpadGesture final : public ITrackpadGesture {
     }
 
     void begin(const STrackpadGestureBegin& e) override {
+        if (sessionLocked())
+            return;
+        m_inputGeneration = inputGeneration;
         m_mode = Mode::Native;
 
         if (!g_controller || !e.swipe) {
@@ -2013,6 +1963,8 @@ class CHymissionWorkspaceTrackpadGesture final : public ITrackpadGesture {
     }
 
     void update(const STrackpadGestureUpdate& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_mode == Mode::Blocked || !e.swipe)
             return;
 
@@ -2030,6 +1982,8 @@ class CHymissionWorkspaceTrackpadGesture final : public ITrackpadGesture {
     }
 
     void end(const STrackpadGestureEnd& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_mode == Mode::Blocked)
             return;
 
@@ -2051,6 +2005,7 @@ class CHymissionWorkspaceTrackpadGesture final : public ITrackpadGesture {
     }
 
   private:
+    std::size_t m_inputGeneration = 0;
     enum class Mode {
         Native,
         Overview,
@@ -2070,6 +2025,9 @@ class CHymissionScrollTrackpadGesture final : public ITrackpadGesture {
     }
 
     void begin(const STrackpadGestureBegin& e) override {
+        if (sessionLocked())
+            return;
+        m_inputGeneration = inputGeneration;
         m_tracking = false;
 
         const auto gestureDirection = e.direction != TRACKPAD_GESTURE_DIR_NONE ? e.direction : m_direction;
@@ -2080,6 +2038,8 @@ class CHymissionScrollTrackpadGesture final : public ITrackpadGesture {
     }
 
     void update(const STrackpadGestureUpdate& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_tracking) {
             if (g_controller && e.swipe)
                 g_controller->updateScrollGesture(*e.swipe);
@@ -2088,6 +2048,8 @@ class CHymissionScrollTrackpadGesture final : public ITrackpadGesture {
     }
 
     void end(const STrackpadGestureEnd& e) override {
+        if (sessionLocked() || m_inputGeneration != inputGeneration)
+            return;
         if (m_tracking) {
             m_tracking = false;
             if (g_controller)
@@ -2101,6 +2063,7 @@ class CHymissionScrollTrackpadGesture final : public ITrackpadGesture {
     }
 
   private:
+    std::size_t m_inputGeneration = 0;
     HymissionScrollMode      m_mode = HymissionScrollMode::Layout;
     eTrackpadGestureDirection m_direction = TRACKPAD_GESTURE_DIR_HORIZONTAL;
     bool                     m_tracking = false;
@@ -2146,7 +2109,7 @@ std::optional<Vector2D> expectedSurfaceSizeForUV(const PHLWINDOW& window, const 
         return std::nullopt;
 
     const bool canUseWindow = window && main;
-    const bool windowSizeMisalign = canUseWindow && window->getReportedSize() != window->wlSurface()->resource()->m_current.size;
+    const bool windowSizeMisalign = canUseWindow && window->backend().reportedSize() != window->wlSurface()->resource()->m_current.size;
 
     if (surface->m_current.viewport.hasDestination)
         return (surface->m_current.viewport.destination * monitor->m_scale).round();
@@ -2161,7 +2124,7 @@ std::optional<Vector2D> expectedSurfaceSizeForUV(const PHLWINDOW& window, const 
         return (surface->m_current.size * monitor->m_scale).round();
 
     if (canUseWindow)
-        return (window->getReportedSize() * monitor->m_scale).round();
+        return (window->backend().reportedSize() * monitor->m_scale).round();
 
     return std::nullopt;
 }
@@ -2196,56 +2159,64 @@ CBox hkSurfaceTexBox(void* surfacePassThisptr) {
     return g_controller->surfaceTexBoxHook(surfacePassThisptr);
 }
 
-std::optional<CBox> hkSurfaceBoundingBox(void* surfacePassThisptr) {
+std::optional<CBox> hkSurfaceBoundingBox(void* surfacePassThisptr, Render::CRenderContext& ctx) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return {};
 
     return g_controller->surfaceBoundingBoxHook(surfacePassThisptr);
 }
 
-CRegion hkSurfaceOpaqueRegion(void* surfacePassThisptr) {
+CRegion hkSurfaceOpaqueRegion(void* surfacePassThisptr, Render::CRenderContext& ctx) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return {};
 
     return g_controller->surfaceOpaqueRegionHook(surfacePassThisptr);
 }
 
-CRegion hkSurfaceVisibleRegion(void* surfacePassThisptr, bool& cancel) {
+CRegion hkSurfaceVisibleRegion(void* surfacePassThisptr, Render::CRenderContext& ctx, bool& cancel) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return {};
 
     return g_controller->surfaceVisibleRegionHook(surfacePassThisptr, cancel);
 }
 
-void hkBorderDraw(void* borderDecorationThisptr, PHLMONITOR monitor, const float& alpha) {
+void hkBorderDraw(void* borderDecorationThisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
-    g_controller->borderDrawHook(borderDecorationThisptr, monitor, alpha);
+    g_controller->borderDrawHook(borderDecorationThisptr, monitor, alpha, presentation);
 }
 
-void hkCustomShadow(void* renderer, const CBox& box, int round, float power, int range,
-                    const Config::CGradientValueData& color, float alpha) {
+void hkCustomShadow(void* renderer, Render::CRenderContext& ctx, const CBox& box, int round, float power, int range,
+                    const Config::CGradientValueData& color, float alpha, const Render::SWindowRenderPresentation& presentation) {
+    RenderContextScope contextScope{ctx};
     if (g_controller)
-        g_controller->customShadowHook(renderer, box, round, power, range, color, alpha);
+        g_controller->customShadowHook(renderer, box, round, power, range, color, alpha, presentation);
 }
 
-void hkShadowDraw(void* shadowDecorationThisptr, PHLMONITOR monitor, const float& alpha) {
+void hkShadowDraw(void* shadowDecorationThisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
-    g_controller->shadowDrawHook(shadowDecorationThisptr, monitor, alpha);
+    g_controller->shadowDrawHook(shadowDecorationThisptr, monitor, alpha, presentation);
 }
 
-void hkGroupBarDraw(void* groupBarDecorationThisptr, PHLMONITOR monitor, const float& alpha) {
+void hkGroupBarDraw(void* groupBarDecorationThisptr, Render::CRenderContext& ctx, PHLMONITOR monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
-    g_controller->groupBarDrawHook(groupBarDecorationThisptr, monitor, alpha);
+    g_controller->groupBarDrawHook(groupBarDecorationThisptr, monitor, alpha, presentation);
 }
 
-void hkCalculateUVForSurface(void* rendererThisptr, PHLWINDOW window, SP<CWLSurfaceResource> surface, PHLMONITOR monitor, bool main, const Vector2D& projSize,
+void hkCalculateUVForSurface(void* rendererThisptr, Render::CRenderContext& ctx, PHLWINDOW window, SP<CWLSurfaceResource> surface, PHLMONITOR monitor, bool main, const Vector2D& projSize,
                              const Vector2D& projSizeUnscaled, bool fixMisalignedFSV1) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
@@ -2253,28 +2224,32 @@ void hkCalculateUVForSurface(void* rendererThisptr, PHLWINDOW window, SP<CWLSurf
     g_controller->calculateUVForSurfaceHook(window, std::move(surface), monitor, main, projSize, projSizeUnscaled, fixMisalignedFSV1);
 }
 
-void hkRendererDrawElement(void* rendererThisptr, WP<IPassElement> element, const CRegion& damage) {
+void hkRendererDrawElement(void* rendererThisptr, Render::CRenderContext& ctx, WP<IPassElement> element, const CRegion& damage) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
     g_controller->rendererDrawElementHook(rendererThisptr, element, damage);
 }
 
-std::vector<UP<IPassElement>> hkSurfaceDraw(void* surfacePassThisptr) {
+std::vector<UP<IPassElement>> hkSurfaceDraw(void* surfacePassThisptr, Render::CRenderContext& ctx) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return {};
 
     return g_controller->surfaceDrawHook(surfacePassThisptr);
 }
 
-bool hkSurfaceNeedsLiveBlur(void* surfacePassThisptr) {
+bool hkSurfaceNeedsLiveBlur(void* surfacePassThisptr, Render::CRenderContext& ctx) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return false;
 
     return g_controller->surfaceNeedsLiveBlurHook(surfacePassThisptr);
 }
 
-bool hkSurfaceNeedsPrecomputeBlur(void* surfacePassThisptr) {
+bool hkSurfaceNeedsPrecomputeBlur(void* surfacePassThisptr, Render::CRenderContext& ctx) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return false;
 
@@ -2288,18 +2263,22 @@ bool hkShouldRenderWindow(void*, PHLWINDOW window, PHLMONITOR monitor) {
     return g_controller->shouldRenderWindowHook(window, monitor);
 }
 
-float hkEffectiveAlpha(void* windowThisptr) {
-    if (!g_controller)
-        return 0.0F;
-
-    return g_controller->effectiveAlphaHook(windowThisptr);
+Render::SWindowRenderPresentation hkEffectiveAlpha(const Desktop::View::CWindowPresentation* presentation, Render::eSceneMode mode) {
+    return g_controller ? g_controller->effectiveAlphaHook(presentation, mode) : Render::SWindowRenderPresentation{};
 }
 
-void hkRenderLayer(void* rendererThisptr, PHLLS layer, PHLMONITOR monitor, const Time::steady_tp& now, bool popups, bool lockscreen) {
+// renderLayer is protected; a subclass re-exposes it for the thunk type check.
+struct OverviewRendererMembers : Render::IHyprRenderer {
+    using Render::IHyprRenderer::renderLayer;
+};
+
+void hkRenderLayer(void* rendererThisptr, Render::CRenderContext& ctx, PHLLS layer, PHLMONITOR monitor, const Time::steady_tp& now, bool popups, bool lockscreen,
+                   bool workspaceScene) {
+    RenderContextScope contextScope{ctx};
     if (!g_controller)
         return;
 
-    g_controller->renderLayerHook(rendererThisptr, layer, monitor, now, popups, lockscreen);
+    g_controller->renderLayerHook(rendererThisptr, layer, monitor, now, popups, lockscreen, workspaceScene);
 }
 
 void hkWorkspaceSwipeBegin(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureBegin& e) {
@@ -2323,11 +2302,8 @@ void hkWorkspaceSwipeEnd(void* gestureThisptr, const ITrackpadGesture::STrackpad
     g_controller->workspaceSwipeEndHook(gestureThisptr, e);
 }
 
-void hkUnifiedWorkspaceSwipeBegin(void* gestureThisptr) {
-    if (!g_controller)
-        return;
-
-    g_controller->unifiedWorkspaceSwipeBeginHook(gestureThisptr);
+bool hkUnifiedWorkspaceSwipeBegin(void* gestureThisptr, PHLMONITOR monitor) {
+    return g_controller && g_controller->unifiedWorkspaceSwipeBeginHook(gestureThisptr, monitor);
 }
 
 void hkUnifiedWorkspaceSwipeUpdate(void* gestureThisptr, double delta) {
@@ -2365,13 +2341,6 @@ void hkScrollMoveGestureEnd(void* gestureThisptr, const ITrackpadGesture::STrack
     g_controller->scrollMoveGestureEndHook(gestureThisptr, e);
 }
 
-std::optional<std::string> hkHandleGesture(void*, const std::string& keyword, const std::string& value) {
-    if (!g_controller)
-        return {};
-
-    return g_controller->handleGestureConfigHook(keyword, value);
-}
-
 } // namespace
 
 OverviewController::OverviewController(HANDLE handle) : m_handle(handle) {
@@ -2379,6 +2348,11 @@ OverviewController::OverviewController(HANDLE handle) : m_handle(handle) {
 }
 
 OverviewController::~OverviewController() {
+    // Cancel deferred callbacks first: none may run once the plugin unloads.
+    m_idleTasks.clear();
+    m_tilesRebuild.reset();
+    clearStripWindowDragState();
+    cancelAndClearTimer(m_hiddenStripProxyRefreshTimer);
     cancelAndClearTimer(m_stripRefreshTimer);
     stopSearchInput();
     setDamageTrackingOverride(false);
@@ -2389,7 +2363,7 @@ OverviewController::~OverviewController() {
     clearPostCloseForcedFocus();
     clearPostCloseDispatcher();
     restoreWorkspaceNameOverrides();
-    g_pHyprRenderer->m_directScanoutBlocked = false;
+
     setFullscreenRenderOverride(false);
     restoreOverviewRenderState();
     restoreWorkspaceTransitionRenderState();
@@ -2417,59 +2391,8 @@ OverviewController::~OverviewController() {
     if (m_scrollMoveGestureEndFunctionHook)
         m_scrollMoveGestureEndFunctionHook->unhook();
 
-    if (m_surfaceTexBoxHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceTexBoxHook);
-    if (m_surfaceBoundingBoxHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceBoundingBoxHook);
-    if (m_surfaceOpaqueRegionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceOpaqueRegionHook);
-    if (m_surfaceVisibleRegionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceVisibleRegionHook);
-    if (m_surfaceDrawHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceDrawHook);
-    if (m_surfaceNeedsLiveBlurHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceNeedsLiveBlurHook);
-    if (m_surfaceNeedsPrecomputeBlurHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_surfaceNeedsPrecomputeBlurHook);
-    if (m_shouldRenderWindowHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderWindowHook);
-    if (m_effectiveAlphaHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_effectiveAlphaHook);
-    if (m_rendererDrawElementHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_rendererDrawElementHook);
-    if (m_borderDrawHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_borderDrawHook);
-    if (m_shadowDrawHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_shadowDrawHook);
-    if (m_customShadowHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_customShadowHook);
-    if (m_groupBarDrawHook) {
-        m_groupBarDrawHook->unhook();
-        HyprlandAPI::removeFunctionHook(m_handle, m_groupBarDrawHook);
-    }
-    if (m_calculateUVForSurfaceHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_calculateUVForSurfaceHook);
-    if (m_workspaceSwipeBeginFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_workspaceSwipeBeginFunctionHook);
-    if (m_workspaceSwipeUpdateFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_workspaceSwipeUpdateFunctionHook);
-    if (m_workspaceSwipeEndFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_workspaceSwipeEndFunctionHook);
-    if (m_unifiedWorkspaceSwipeBeginFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_unifiedWorkspaceSwipeBeginFunctionHook);
-    if (m_unifiedWorkspaceSwipeUpdateFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_unifiedWorkspaceSwipeUpdateFunctionHook);
-    if (m_unifiedWorkspaceSwipeEndFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_unifiedWorkspaceSwipeEndFunctionHook);
-    if (m_scrollMoveGestureBeginFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_scrollMoveGestureBeginFunctionHook);
-    if (m_scrollMoveGestureUpdateFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_scrollMoveGestureUpdateFunctionHook);
-    if (m_scrollMoveGestureEndFunctionHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_scrollMoveGestureEndFunctionHook);
-    if (m_handleGestureHook)
-        HyprlandAPI::removeFunctionHook(m_handle, m_handleGestureHook);
-
+    releaseAllHooks();
+    decorationGradientOriginal = nullptr;
     g_controller = nullptr;
 }
 
@@ -2479,11 +2402,25 @@ bool OverviewController::initialize() {
 
     auto& events = Event::bus()->m_events;
 
-    m_renderStageListener = events.render.stage.listen([this](eRenderStage stage) { renderStage(stage); });
+    m_scanoutPreChecksListener = events.render.preChecks.listen([this](PHLMONITOR monitor) {
+        if ((isVisible() || m_deactivatePending) && ownsMonitor(monitor))
+            monitor->m_solitaryClient.reset();
+    });
+    m_renderStageListener = events.render.stage.listen([this](Event::SRenderStageEvent event) {
+        if (event.context) {
+            RenderContextScope scope{event.context->get()};
+            renderStage(event.stage);
+        } else
+            renderStage(event.stage);
+    });
     m_mouseMoveListener = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo&) {
+        if (sessionLocked())
+            return;
         handleMouseMove();
     });
     m_mouseButtonListener = events.input.mouse.button.listen([this](const IPointer::SButtonEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         // Copy the signal payload immediately; forwarding the raw listener arg
         // has produced corrupted button/state values on current Hyprland builds.
         const auto copiedEvent = event;
@@ -2491,26 +2428,47 @@ bool OverviewController::initialize() {
             info.cancelled = true;
     });
     m_mouseAxisListener = events.input.mouse.axis.listen([this](const IPointer::SAxisEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         if (handleMouseAxis(event))
             info.cancelled = true;
     });
     m_touchDownListener = events.input.touch.down.listen([this](const ITouch::SDownEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         if (handleTouchDown(event))
             info.cancelled = true;
     });
     m_touchMotionListener = events.input.touch.motion.listen([this](const ITouch::SMotionEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         if (handleTouchMotion(event))
             info.cancelled = true;
     });
     m_touchUpListener = events.input.touch.up.listen([this](const ITouch::SUpEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         if (handleTouchUp(event))
             info.cancelled = true;
     });
     m_touchCancelListener = events.input.touch.cancel.listen([this](const ITouch::SCancelEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
         if (handleTouchUp(ITouch::SUpEvent{.timeMs = event.timeMs, .touchID = event.touchID}, true))
             info.cancelled = true;
     });
-    m_keyboardListener = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) { handleKeyboard(event, info); });
+    if (g_pSessionLockManager) {
+        m_sessionLockListener = g_pSessionLockManager->m_events.lock.listen([this] { handleSessionLock(); });
+        m_sessionUnlockListener = g_pSessionLockManager->m_events.unlock.listen([this] {
+            if (isVisible())
+                scheduleVisibleStateRebuild();
+        });
+    }
+    m_keyboardListener = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+        if (sessionLocked())
+            return;
+        handleKeyboard(event, info);
+    });
     m_windowOpenListener = events.window.open.listen([this](PHLWINDOW window) {
         clearWindowClosePending(window);
         handleWindowSetChange(window, WindowSetChangeKind::Open);
@@ -2524,12 +2482,22 @@ bool OverviewController::initialize() {
         handleWindowSetChange(window, WindowSetChangeKind::General, true);
     });
     m_windowCloseListener = events.window.close.listen([this](PHLWINDOW window) {
+        if (m_draggedWindowIndex && *m_draggedWindowIndex<m_state.windows.size() && m_state.windows[*m_draggedWindowIndex].window==window)
+            clearStripWindowDragState();
         if (isVisible())
             markWindowClosePending(window);
         pruneWindowActivationHistory(window);
         handleWindowSetChange(window, WindowSetChangeKind::General, true);
     });
-    m_windowActiveListener = events.window.active.listen([this](PHLWINDOW window, Desktop::eFocusReason) { recordWindowActivation(window); });
+    m_windowActiveListener = events.window.active.listen([this](PHLWINDOW window, Desktop::eFocusReason) {
+        recordWindowActivation(window);
+        // Main overview slots remain frozen on focus (FB7). The strip is a
+        // desktop mirror: focus may resize a scrolling column or move its camera.
+        if (isVisible() && workspaceStripEnabled(m_state)) {
+            m_stripSnapshotsDirty = true;
+            scheduleWorkspaceStripSnapshotRefresh();
+        }
+    });
     m_windowMoveWorkspaceListener =
         events.window.moveToWorkspace.listen([this](PHLWINDOW window, PHLWORKSPACE) { handleWindowSetChange(window, WindowSetChangeKind::MoveToWorkspace); });
     m_workspaceActiveListener = events.workspace.active.listen([this](PHLWORKSPACE workspace) { handleWorkspaceChange(workspace); });
@@ -2539,6 +2507,7 @@ bool OverviewController::initialize() {
             updateHoveredFromPointer(false, false, false, false, "monitor-focused");
     });
     m_configReloadedListener = events.config.reloaded.listen([this] {
+        configCommands.reset();
         warnAboutDeprecatedExpansionConfig();
         warnAboutVimLabels();
         replaceNativeWorkspaceGestures("config-reloaded");
@@ -2556,11 +2525,11 @@ void OverviewController::pruneWindowActivationHistory(const PHLWINDOW& removedWi
     if (removedWindow)
         m_windowMruSerials.erase(removedWindow);
 
-    std::erase_if(m_windowMruSerials, [](const auto& entry) { return !entry.first || !entry.first->m_isMapped; });
+    std::erase_if(m_windowMruSerials, [](const auto& entry) { return !entry.first || !entry.first->mapped(); });
 }
 
 void OverviewController::recordWindowActivation(const PHLWINDOW& window, bool allowWhileVisible) {
-    if (!window || !window->m_isMapped || window->isHidden())
+    if (!window || !window->mapped() || window->isHidden())
         return;
 
     if (!allowWhileVisible && isVisible())
@@ -2589,6 +2558,9 @@ SP<IKeyboard> OverviewController::inputKeyboardWithState() const {
 }
 
 bool OverviewController::switchReleaseKeyHeld() const {
+    if (sessionLocked())
+        return false;
+
     if (!toggleSwitchModeEnabled())
         return false;
 
@@ -2597,7 +2569,7 @@ bool OverviewController::switchReleaseKeyHeld() const {
         return false;
 
     if (const auto modifierMask = switchReleaseModifierMask(releaseKey))
-        return anyKeyboardWithState([modifierMask](const auto& keyboard) { return (keyboard->getModifiers() & *modifierMask) != 0; });
+        return anyKeyboardWithState([modifierMask](const auto& keyboard) { return (static_cast<uint32_t>(keyboard->getModifiers()) & *modifierMask) != 0; });
 
     if (const auto configuredKeycode = parseSwitchReleaseKeycode(releaseKey))
         return anyKeyboardWithState([configuredKeycode](const auto& keyboard) { return keyboard->getPressed(*configuredKeycode); });
@@ -2648,6 +2620,9 @@ bool OverviewController::isSwitchReleaseEvent(const IKeyboard::SKeyEvent& event,
 }
 
 void OverviewController::updateToggleSwitchSessionReleaseTracking(const char* source) {
+    if (sessionLocked())
+        return;
+
     if (!m_toggleSwitchSessionActive || m_beginCloseInProgress || m_state.phase == Phase::Inactive || m_state.phase == Phase::Closing ||
         m_state.phase == Phase::ClosingSettle)
         return;
@@ -2678,6 +2653,9 @@ void OverviewController::updateToggleSwitchSessionReleaseTracking(const char* so
 }
 
 void OverviewController::scheduleToggleSwitchReleasePoll() {
+    if (sessionLocked())
+        return;
+
     if (!g_pEventLoopManager)
         return;
 
@@ -2685,6 +2663,10 @@ void OverviewController::scheduleToggleSwitchReleasePoll() {
         m_toggleSwitchReleasePollTimer = makeShared<CEventLoopTimer>(
             TOGGLE_SWITCH_RELEASE_POLL_INTERVAL,
             [this](SP<CEventLoopTimer> self, void*) {
+                if (sessionLocked()) {
+                    self->updateTimeout(std::nullopt);
+                    return;
+                }
                 updateToggleSwitchSessionReleaseTracking("poll");
 
                 if (!m_toggleSwitchSessionActive || m_beginCloseInProgress || m_state.phase == Phase::Inactive || m_state.phase == Phase::Closing ||
@@ -2720,6 +2702,11 @@ void OverviewController::clearToggleSwitchSession() {
 }
 
 SDispatchResult OverviewController::open(const std::string& args) {
+    if (!m_initError.empty())
+        return {.success = false, .error = m_initError};
+    if (sessionLocked())
+        return {};
+
     std::string error;
     const auto requestedScope = parseScopeOverride(args, error);
     if (!requestedScope)
@@ -2746,6 +2733,10 @@ bool OverviewController::blocksWorkspaceSwitchInOverviewForGestures() const {
 }
 
 SDispatchResult OverviewController::close() {
+    clearStripWindowDragState();
+    if (sessionLocked())
+        return {};
+
     if (m_state.phase == Phase::Inactive || m_state.phase == Phase::Closing || m_state.phase == Phase::ClosingSettle)
         return {};
 
@@ -2757,6 +2748,11 @@ SDispatchResult OverviewController::close() {
 }
 
 SDispatchResult OverviewController::toggle(const std::string& args) {
+    if (!m_initError.empty())
+        return {.success = false, .error = m_initError};
+    if (sessionLocked())
+        return {};
+
     const auto toggleArguments = parseToggleArguments(args);
     if (!toggleArguments)
         return {.success = false, .error = "invalid toggle argument: " + args};
@@ -2848,13 +2844,27 @@ std::string OverviewController::overviewStateJson() const {
         {"version", 1},
         {"active", isVisible()},
         {"phase", phaseName()},
+        {"relayout_active", m_state.relayoutActive},
+        {"relayout_progress", m_state.relayoutProgress},
+        {"transient_window_count", m_state.transientClosingWindows.size()},
+        {"gesture", {{"active", m_gestureSession.active}, {"opening", m_gestureSession.opening},
+                     {"signed_progress", m_gestureSession.signedProgress}, {"hidden_gap", m_gestureSession.hiddenGapProgress}}},
+        {"visualProgress", visualProgress()},
+        {"initError", m_initError},
         {"groupedWindowsPolicy", groupedWindowsPolicy() == GroupedWindowsPolicy::Collapsed ? "collapsed" : "expanded"},
         {"windows", nlohmann::json::array()},
     };
 
     if (!isVisible())
-        return root.dump() + "\n";
+        return dumpStateJson(root) + "\n";
 
+    root["window_layout_scope"]=m_state.collectionPolicy.onlyActiveWorkspace?"workspace":"all";
+    root["tile_groups"]=nlohmann::json::array();
+    root["strip"]=nlohmann::json::array();
+    if (auto* tiles=TilesController::get();tiles && workspaceScoped()) for (const auto& mon:m_state.participatingMonitors) for (const auto& view:tiles->views(mon)) {
+        root["tile_groups"].push_back({{"monitor",mon->m_name},{"tile_id",view.id},{"focused",view.focused && Desktop::focusState()->monitor()==mon},{"geometry",rectJson({view.allocation.x,view.allocation.y,view.allocation.w,view.allocation.h})}});
+    }
+    for (const auto& entry:m_state.stripEntries) root["strip"].push_back({{"monitor",entry.monitor?entry.monitor->m_name:""},{"tile_id",entry.tileId},{"workspace",entry.workspaceId},{"active",entry.active},{"focused_tile",entry.groupFocused},{"geometry",rectJson(entry.rect)}});
     std::size_t zIndex = 0;
     for (const auto& managed : m_state.windows) {
         if (!managed.window)
@@ -2867,21 +2877,27 @@ std::string OverviewController::overviewStateJson() const {
         const Rect selection = overviewBorderOuterRectForWindow(managed.window, content);
         nlohmann::json item{
             {"address", overviewWindowAddress(managed.window)},
-            {"title", managed.window->m_title},
-            {"class", managed.window->m_class},
+            {"title", managed.window->metadata().title()},
+            {"class", managed.window->metadata().appID()},
             {"contentGeometry", rectJson(content)},
+            {"animationFromGeometry",rectJson(managed.stageOpeningGlobal.value_or(managed.naturalGlobal))},
+            {"animationToGeometry",rectJson(managed.targetGlobal)},
+            {"exitGeometry",rectJson(managed.exitGlobal)},
+            {"workspaceAlpha",managed.window->m_workspace?managed.window->m_workspace->m_alpha->value():1.F},
             {"selectionGeometry", rectJson(selection)},
             {"zIndex", zIndex++},
         };
 
         if (managed.targetMonitor)
             item["monitor"] = managed.targetMonitor->m_name;
+        if (auto* tiles=TilesController::get()) item["tile_id"]=tiles->preferredTile(managed.window->m_workspace,managed.targetMonitor);
         item["stageOpeningReveal"] = managed.stageOpeningEndpoint.has_value();
         item["stageClosingReveal"] = managed.stageClosingEndpoint.has_value();
         if (const auto frame = stageTransitionFrame(managed.window, managed.targetMonitor)) {
             item["stageTransitionClip"] = rectJson(frame->clip);
             item["stageTransitionViewport"] = rectJson(frame->viewport.box);
             item["stageTransitionEdges"] = {frame->viewport.left, frame->viewport.right, frame->viewport.top, frame->viewport.bottom};
+            item["stageTransitionSharedDecorations"] = frame->viewport.revealDecorations;
         }
         if (managed.group) {
             item["groupSize"] = managed.group->size();
@@ -2894,7 +2910,7 @@ std::string OverviewController::overviewStateJson() const {
         root["windows"].push_back(std::move(item));
     }
 
-    return root.dump() + "\n";
+    return dumpStateJson(root) + "\n";
 }
 
 std::string OverviewController::handleRawWindowRenderCommand(const std::string& args) {
@@ -2979,6 +2995,9 @@ bool OverviewController::captureInputSuppressed() const {
 }
 
 void OverviewController::renderStage(eRenderStage stage) {
+    if (sessionLocked())
+        return;
+
     if (m_stripSnapshotRenderDepth > 0)
         return;
 
@@ -2988,7 +3007,7 @@ void OverviewController::renderStage(eRenderStage stage) {
     if (!isVisible())
         return;
 
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     if (!monitor || !ownsMonitor(monitor))
         return;
 
@@ -3018,6 +3037,7 @@ void OverviewController::renderStage(eRenderStage stage) {
         flushQueuedRealFocusDuringOverview();
         renderBackdrop();
     } else if (stage == RENDER_POST_WINDOWS) {
+        scheduleHiddenStripLayerProxyRefresh();
         if (m_deactivatePending) {
             if (debugLogsEnabled())
                 debugLog("[hymission] post-windows queue deferred deactivate");
@@ -3025,7 +3045,7 @@ void OverviewController::renderStage(eRenderStage stage) {
             return;
         }
 
-        g_pHyprRenderer->m_renderPass.add(makeUnique<OverviewOverlayPassElement>(this, monitor));
+        renderContext().m_pass.add(makeUnique<OverviewOverlayPassElement>(this, monitor));
         if (shouldContinuouslyRefreshWorkspaceStripSnapshots()) {
             if (getConfigInt(m_handle, "plugin:hymission:workspace_strip_refresh_ms", 500) <= 0) {
                 cancelAndClearTimer(m_stripRefreshTimer);
@@ -3049,6 +3069,9 @@ void OverviewController::renderStage(eRenderStage stage) {
 }
 
 void OverviewController::handleMouseMove() {
+    if (sessionLocked())
+        return;
+
     if (m_restoreScrollingFollowFocusAfterScrollMouseMove && !m_scrollGestureSession.active) {
         if (debugLogsEnabled())
             debugLog("[hymission] restore scrolling:follow_focus after scroll mouse move");
@@ -3079,6 +3102,7 @@ void OverviewController::handleMouseMove() {
         if (!m_draggedWindowIndex && m_pressedWindowIndex && *m_pressedWindowIndex < m_state.windows.size()) {
             const double distance = std::hypot(pointer.x - m_pressedWindowPointer.x, pointer.y - m_pressedWindowPointer.y);
             if (distance >= 14.0) {
+                if (auto* tiles=TilesController::get();tiles && !tiles->acquire(TilesController::Owner::OverviewDrag)) return;
                 const auto& managed = m_state.windows[*m_pressedWindowIndex];
                 const Rect  rect = currentPreviewRect(managed);
                 m_dropAnimation.reset();
@@ -3135,14 +3159,14 @@ void OverviewController::beginGroupDrag(std::size_t windowIndex, const Vector2D&
 
         ManagedWindow injected = base;
         injected.window = member;
-        injected.title = member->m_title;
+        injected.title = member->metadata().title();
         injected.naturalGlobal = baseRect;
         injected.exitGlobal = baseRect;
         injected.relayoutFromGlobal = baseRect;
         injected.targetGlobal = baseRect;
-        injected.previewAlpha = overviewPreviewAlphaForWindow(member, true);
-        injected.isFloating = member->m_isFloating;
-        injected.isPinned = member->m_pinned;
+        injected.previewAlphaWithoutActive = overviewPreviewAlphaForWindow(member, true, true);
+        injected.isFloating = member->isFloating();
+        injected.isPinned = static_cast<bool>(member->m_state & Desktop::View::WINDOW_STATE_PINNED);
         injected.collapsedGroup = false;
         injected.dragOnly = true;
         m_state.windows.push_back(std::move(injected));
@@ -3169,6 +3193,9 @@ void OverviewController::beginGroupDrag(std::size_t windowIndex, const Vector2D&
 }
 
 bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) {
+    if (sessionLocked())
+        return false;
+
     if (m_postCloseForcedFocusLatched && !isVisible()) {
         clearPostCloseForcedFocus();
         if (m_restoreInputFollowMouseAfterPostClose) {
@@ -3299,18 +3326,25 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
                 dropInitialDim = raw * raw * (3.0 - 2.0 * raw);
             }
             PHLWORKSPACE targetWorkspace;
+            uint64_t targetTile=0;
 
             if (window && hoveredStripIndex && *hoveredStripIndex < m_state.stripEntries.size()) {
                 const auto& entry = m_state.stripEntries[*hoveredStripIndex];
-                targetWorkspace = entry.workspace ? entry.workspace : ::State::workspaceState()->query().id(entry.workspaceId).run();
+                targetTile=entry.tileId;
+                targetWorkspace = entry.workspace ? entry.workspace : workspaceForKey(entry.workspaceId);
                 if (!targetWorkspace && entry.monitor && entry.workspaceId != WORKSPACE_INVALID) {
                     const std::string targetName = entry.workspaceName.empty() ? std::to_string(entry.workspaceId) : entry.workspaceName;
-                    targetWorkspace = ::State::workspaceState()->create(entry.workspaceId, entry.monitor->m_id, targetName);
+                    targetWorkspace = createWorkspaceForKey(entry.workspaceId, entry.monitor->m_id, targetName);
                 }
             } else if (window && thumbnailDropIndex && *thumbnailDropIndex < m_state.windows.size()) {
                 const auto targetGroup = m_state.windows[*thumbnailDropIndex].slot.rowGroup;
                 if (targetGroup < m_state.managedWorkspaces.size())
                     targetWorkspace = m_state.managedWorkspaces[targetGroup];
+            } else if (window && workspaceScoped() && !hoveredStripIndex) {
+                if (const auto target=tileDesktopDropTarget(window,dropMonitor,pointerBeforeUpdate)) {
+                    targetTile=target->id;
+                    targetWorkspace=target->workspace;
+                }
             }
 
             if (groupDrag && m_groupDragSession && window) {
@@ -3322,6 +3356,7 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
                 }
                 session.commitDrop = targetWorkspace && window->m_workspace != targetWorkspace && dropTarget.has_value();
                 session.targetWorkspace = session.commitDrop ? targetWorkspace : PHLWORKSPACE{};
+                session.targetTile=targetTile;
                 if (session.commitDrop) {
                     const Rect leadSource = session.sourceRects[session.frontMember];
                     const double targetScale = leadSource.width > 1.0 ? std::clamp(dropTarget->preview.width / leadSource.width, 0.05, DRAG_PREVIEW_SCALE) : 0.2;
@@ -3350,7 +3385,7 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
                         .monitor = dropMonitor,
                         .framebuffer = dropFramebuffer,
                         .texture = dropTexture,
-                        .workspaceId = targetWorkspace->m_id,
+                        .workspaceId = workspaceKey(targetWorkspace),
                         .from = *draggedPreview,
                         .to = dropTarget->preview,
                         .initialDim = dropInitialDim,
@@ -3358,7 +3393,7 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
                         .start = std::chrono::steady_clock::now(),
                     };
                 }
-                moveWindowToWorkspaceForThumbnailDrop(window, targetWorkspace);
+                moveWindowToWorkspaceForThumbnailDrop(window, targetWorkspace,targetTile);
                 refreshWorkspaceLayoutSnapshot(sourceWorkspace, true);
                 refreshWorkspaceLayoutSnapshot(targetWorkspace, true);
                 if (Animation::mgr())
@@ -3370,7 +3405,7 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
                     .monitor = dropMonitor,
                     .framebuffer = dropFramebuffer,
                     .texture = dropTexture,
-                    .workspaceId = window->m_workspace ? window->m_workspace->m_id : WORKSPACE_INVALID,
+                    .workspaceId = window->m_workspace ? workspaceKey(window->m_workspace) : WORKSPACE_INVALID,
                     .from = *draggedPreview,
                     .to = dragReturnTarget,
                     .initialDim = 0.0,
@@ -3448,6 +3483,9 @@ bool OverviewController::handleMouseButton(const IPointer::SButtonEvent& event) 
 }
 
 bool OverviewController::handleMouseAxis(const IPointer::SAxisEvent& event) {
+    if (sessionLocked())
+        return false;
+
     if (!shouldHandleInput() || event.axis != WL_POINTER_AXIS_VERTICAL_SCROLL || m_draggedWindowIndex)
         return false;
 
@@ -3481,6 +3519,21 @@ bool OverviewController::handleMouseAxis(const IPointer::SAxisEvent& event) {
 }
 
 void OverviewController::handleKeyboard(const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+    if (sessionLocked())
+        return;
+
+    if (m_draggedWindowIndex && event.keycode==KEY_ESC && event.state==WL_KEYBOARD_KEY_STATE_PRESSED) {
+        clearStripWindowDragState();
+        m_primaryButtonPressed=false;
+        damageOwnedMonitors();
+        if (auto* tiles=TilesController::get();tiles && tiles->available()) {
+            info.cancelled=true;
+            return;
+        }
+        // With tiles off, continue native Escape handling after cancelling the
+        // drag (close overview, or let an active search consume Escape).
+    }
+
     const auto keyboard = inputKeyboardWithState();
     if (!keyboard || !keyboard->m_xkbState)
         return;
@@ -3502,7 +3555,7 @@ void OverviewController::handleKeyboard(const IKeyboard::SKeyEvent& event, Event
     if (m_toggleSwitchSessionActive && event.state == WL_KEYBOARD_KEY_STATE_RELEASED && isSwitchReleaseEvent(event, keyboard)) {
         if (debugLogsEnabled()) {
             std::ostringstream out;
-            out << "[hymission] toggle switch release close key=" << switchReleaseKeyConfig() << " keycode=" << event.keycode << " modifiers=" << keyboard->getModifiers();
+            out << "[hymission] toggle switch release close key=" << switchReleaseKeyConfig() << " keycode=" << event.keycode << " modifiers=" << static_cast<uint32_t>(keyboard->getModifiers());
             debugLog(out.str());
         }
         beginClose(CloseMode::ActivateSelection);
@@ -3510,31 +3563,41 @@ void OverviewController::handleKeyboard(const IKeyboard::SKeyEvent& event, Event
         return;
     }
 
+    const xkb_keysym_t keysym = xkb_state_key_get_one_sym(keyboard->m_xkbState, event.keycode + 8);
     if (m_searchActive && m_searchInputFd >= 0) {
-        // A spawned helper is not necessarily mapped or focused yet. Never let
-        // search keystrokes reach the application underneath the overview.
-        if (!ensureSearchInputFocus()) {
-            if (m_searchPendingKeys.size() < 256) {
-                auto* state = keyboard->m_xkbState;
-                m_searchPendingKeys.push_back({event,
-                    xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED),
-                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED),
-                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED),
-                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE)});
-            }
-            info.cancelled = true;
-            if (m_searchFocusTimer)
-                wl_event_source_timer_update(m_searchFocusTimer, 8);
+        const bool focused = ensureSearchInputFocus();
+        // ensureSearchInputFocus may stop an expired search. Let this event
+        // continue through normal overview handling in that case.
+        if (m_searchActive) {
+            const auto route = routeSearchKey(
+                searchKeyAction(focused, event.state == WL_KEYBOARD_KEY_STATE_PRESSED && keysym == XKB_KEY_Escape),
+                [this] {
+                    stopSearchInput();
+                    rebuildVisibleState({}, true);
+                },
+                [&] {
+                    if (m_searchPendingKeys.size() < 256) {
+                        auto* state = keyboard->m_xkbState;
+                        m_searchPendingKeys.push_back({event,
+                            xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED),
+                            xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED),
+                            xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED),
+                            xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_EFFECTIVE)});
+                    }
+                    info.cancelled = true;
+                    if (m_searchFocusTimer)
+                        wl_event_source_timer_update(m_searchFocusTimer, SearchFocusWait::RETRY_MS);
+                });
+            if (route == SearchKeyRoute::Helper)
+                return;
+            // Resume normal overview handling, including its cancellation of Escape.
         }
-        return;
     }
 
     if (event.state != WL_KEYBOARD_KEY_STATE_PRESSED)
         return;
 
-    const xkb_keysym_t keysym = xkb_state_key_get_one_sym(keyboard->m_xkbState, event.keycode + 8);
-
-    if (!overviewTextInputAllowed(keyboard->getModifiers(), HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_META)) {
+    if (!overviewTextInputAllowed(static_cast<uint32_t>(keyboard->getModifiers()), static_cast<uint32_t>(Input::HL_MODIFIER_CTRL | Input::HL_MODIFIER_ALT | Input::HL_MODIFIER_META))) {
         clearPickLabelPrefixState();
         return;
     }
@@ -3564,7 +3627,7 @@ void OverviewController::handleKeyboard(const IKeyboard::SKeyEvent& event, Event
 
     if (keysym == XKB_KEY_Tab || keysym == XKB_KEY_ISO_Left_Tab) {
         clearPickLabelPrefixState();
-        const bool reverse = keysym == XKB_KEY_ISO_Left_Tab || (keyboard->getModifiers() & HL_MODIFIER_SHIFT);
+        const bool reverse = keysym == XKB_KEY_ISO_Left_Tab || (keyboard->getModifiers() & Input::HL_MODIFIER_SHIFT);
         (void)moveSelectionCircular(reverse ? -1 : 1, "keyboard-tab");
         info.cancelled = true;
         return;
@@ -3606,11 +3669,28 @@ void OverviewController::handleKeyboard(const IKeyboard::SKeyEvent& event, Event
 }
 
 bool OverviewController::ensureSearchInputFocus() {
-    if (!m_searchActive || m_searchInputPid <= 0 || !g_pSeatManager)
+    if (sessionLocked()) {
+        stopSearchInput();
+        return false;
+    }
+
+    if (!m_searchActive || m_searchInputPid <= 0)
+        return false;
+
+    const auto now = SearchFocusWait::Clock::now();
+    m_searchFocusWait.begin(now);
+    if (m_searchFocusWait.expired(now)) {
+        stopSearchInput();
+        if (isVisible() && m_state.phase != Phase::Closing && m_state.phase != Phase::ClosingSettle)
+            rebuildVisibleState({}, true);
+        notifySearchFailureOnce("[hymission] search input helper timed out waiting for keyboard focus");
+        return false;
+    }
+    if (!g_pSeatManager)
         return false;
 
     for (const auto& layer : Desktop::viewState()->layers()) {
-        if (!layer || !layer->m_mapped || layer->m_namespace != "hymission-search" || layer->getPID() != m_searchInputPid)
+        if (!layer || !layer->mapped() || layer->m_namespace != "hymission-search" || layer->getPID() != m_searchInputPid)
             continue;
         const auto resource = layer->m_layerSurface.lock();
         const auto surface = resource ? resource->m_surface.lock() : nullptr;
@@ -3635,12 +3715,18 @@ bool OverviewController::ensureSearchInputFocus() {
             }
         }
         m_searchPendingKeys.clear();
+        m_searchFocusWait.reset();
         return true;
     }
     return false;
 }
 
 bool OverviewController::startSearchInput() {
+    if (sessionLocked()) {
+        stopSearchInput();
+        return false;
+    }
+
     if (m_searchActive)
         return true;
 
@@ -3663,7 +3749,8 @@ bool OverviewController::startSearchInput() {
         posix_spawn_file_actions_addclose(&actions, sockets[0]);
     if (sockets[1] != 3)
         posix_spawn_file_actions_addclose(&actions, sockets[1]);
-    char* argv[] = {const_cast<char*>(helper.c_str()), nullptr};
+    const std::string placement = searchInputPlacement();
+    char* argv[] = {const_cast<char*>(helper.c_str()), const_cast<char*>(placement.c_str()), nullptr};
     pid_t pid = -1;
     posix_spawnattr_t attributes;
     const int attrError = posix_spawnattr_init(&attributes);
@@ -3685,6 +3772,8 @@ bool OverviewController::startSearchInput() {
     m_searchInputFd = sockets[0];
     m_searchInputPid = pid;
     m_searchActive = true;
+    m_searchFocusWait.reset();
+    m_searchFocusWait.begin(SearchFocusWait::Clock::now());
     m_searchPreeditActive = false;
     m_searchQuery.clear();
     m_searchNormalizedQuery.clear();
@@ -3703,19 +3792,20 @@ bool OverviewController::startSearchInput() {
     }
     m_searchFocusTimer = wl_event_loop_add_timer(loop, [](void* data) {
         auto* controller = static_cast<OverviewController*>(data);
-        if (controller->m_searchActive && !controller->ensureSearchInputFocus())
-            wl_event_source_timer_update(controller->m_searchFocusTimer, 8);
+        if (controller->m_searchActive && !controller->ensureSearchInputFocus() && controller->m_searchFocusTimer)
+            wl_event_source_timer_update(controller->m_searchFocusTimer, SearchFocusWait::RETRY_MS);
         return 0;
     }, this);
     if (!m_searchFocusTimer) {
         stopSearchInput();
         return false;
     }
-    wl_event_source_timer_update(m_searchFocusTimer, 8);
+    wl_event_source_timer_update(m_searchFocusTimer, SearchFocusWait::RETRY_MS);
     return true;
 }
 
 void OverviewController::stopSearchInput(bool clearSearchState) {
+    m_searchFocusWait.reset();
     if (m_searchFocusTimer) {
         wl_event_source_remove(m_searchFocusTimer);
         m_searchFocusTimer = nullptr;
@@ -3743,6 +3833,11 @@ void OverviewController::stopSearchInput(bool clearSearchState) {
 }
 
 int OverviewController::handleSearchInputFd(uint32_t mask) {
+    if (sessionLocked()) {
+        stopSearchInput();
+        return 0;
+    }
+
     if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
         stopSearchInput();
         if (isVisible() && m_state.phase != Phase::Closing && m_state.phase != Phase::ClosingSettle)
@@ -3802,7 +3897,6 @@ void OverviewController::applySearchQuery(std::string query) {
     }
     clearSpatialPickCache();
     rebuildVisibleState(preferred, false);
-    sendSearchResultCount();
 }
 
 void OverviewController::sendSearchResultCount() const {
@@ -3810,11 +3904,13 @@ void OverviewController::sendSearchResultCount() const {
         return;
     const std::string packet = "C" + std::to_string(m_state.windows.size());
     send(m_searchInputFd, packet.data(), packet.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+    const std::string geometry = "G" + searchInputPlacement();
+    send(m_searchInputFd, geometry.data(), geometry.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
 }
 
 bool OverviewController::windowMatchesActiveSearch(const PHLWINDOW& window) const {
     return !m_searchActive || m_searchNormalizedQuery.empty() ||
-        (window && windowMatchesSearch(window->m_title, window->m_class, m_searchNormalizedQuery));
+        (window && windowMatchesSearch(window->metadata().title(), window->metadata().appID(), m_searchNormalizedQuery));
 }
 
 void OverviewController::notifySearchFailureOnce(const std::string& message) {
@@ -3848,7 +3944,7 @@ void OverviewController::handleWindowSetChange(PHLWINDOW window, WindowSetChange
     if (kind == WindowSetChangeKind::Open)
         (void)placeNewWindowInHoveredThumbnailWorkspace(window);
 
-    if (kind == WindowSetChangeKind::MoveToWorkspace && window->m_pinned) {
+    if (kind == WindowSetChangeKind::MoveToWorkspace && static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
         const auto* managed = managedWindowFor(m_state, window);
         const auto nextMonitor = preferredMonitorForWindow(window, m_state);
         if (managed && windowMatchesOverviewScope(window, m_state, false) && managed->targetMonitor && nextMonitor == managed->targetMonitor) {
@@ -3936,7 +4032,7 @@ void OverviewController::handleWorkspaceChange(PHLWORKSPACE workspace) {
     const auto refreshWorkspaceStripActivity = [this]() {
         bool changed = false;
         for (auto& entry : m_state.stripEntries) {
-            const bool active = entry.monitor && entry.workspace && entry.monitor->m_activeWorkspace == entry.workspace;
+            const bool active = isCurrentActiveWorkspaceStripEntry(entry);
             if (entry.active == active)
                 continue;
 
@@ -4017,6 +4113,7 @@ void OverviewController::handleWorkspaceChange(PHLWORKSPACE workspace) {
 }
 
 void OverviewController::handleMonitorChange(PHLMONITOR monitor) {
+    clearStripWindowDragState();
     if (!isVisible() || !monitor || !m_state.ownerMonitor)
         return;
 
@@ -4046,8 +4143,9 @@ bool OverviewController::shouldRenderWindowHook(const PHLWINDOW& window, const P
     const auto workspace = window ? window->m_workspace : PHLWORKSPACE{};
     const auto workspaceMonitor = workspace ? workspace->m_monitor.lock() : PHLMONITOR{};
     const bool activeWorkspace = workspaceMonitor &&
-        (workspaceMonitor->m_activeWorkspace == workspace || workspaceMonitor->m_activeSpecialWorkspace == workspace);
-    if (shouldSuppressOverviewExitWindow(m_deactivatePending, rawWindowRenderActive(), window && window->m_pinned,
+        (workspaceMonitor->m_activeWorkspace == workspace || workspaceMonitor->m_activeSpecialWorkspace == workspace ||
+         (TilesController::get() && TilesController::get()->presented(workspace)));
+    if (shouldSuppressOverviewExitWindow(m_deactivatePending, rawWindowRenderActive(), window && static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED),
                                         static_cast<bool>(workspace), activeWorkspace))
         return false;
 
@@ -4067,7 +4165,7 @@ bool OverviewController::shouldRenderWindowHook(const PHLWINDOW& window, const P
         const auto* collapsed = collapsedOverviewItemFor(window);
         if (collapsed && collapsed->targetMonitor == monitor &&
             shouldSuppressCollapsedGroupMember(reinterpret_cast<std::uintptr_t>(collapsed->group.get()),
-                                                reinterpret_cast<std::uintptr_t>(window->m_group.get()),
+                                                reinterpret_cast<std::uintptr_t>(window->grouping().group().get()),
                                                 reinterpret_cast<std::uintptr_t>(collapsed->window.get()),
                                                 reinterpret_cast<std::uintptr_t>(window.get())))
             return false;
@@ -4115,17 +4213,15 @@ bool OverviewController::shouldRenderWindowHook(const PHLWINDOW& window, const P
     return m_shouldRenderWindowOriginal(g_pHyprRenderer.get(), window, monitor);
 }
 
-float OverviewController::effectiveAlphaHook(void* windowThisptr) {
+Render::SWindowRenderPresentation OverviewController::effectiveAlphaHook(const Desktop::View::CWindowPresentation* presentation, Render::eSceneMode mode) {
     if (!m_effectiveAlphaOriginal)
-        return 0.0F;
+        return {};
 
-    const float originalAlpha = m_effectiveAlphaOriginal(windowThisptr);
-    if (!windowThisptr)
-        return originalAlpha;
+    auto result = m_effectiveAlphaOriginal(presentation, mode);
 
     const auto findInState = [&](const State& state) -> const ManagedWindow* {
         const auto it = std::find_if(state.windows.begin(), state.windows.end(),
-                                     [&](const ManagedWindow& managed) { return managed.window && managed.window.get() == windowThisptr; });
+                                     [&](const ManagedWindow& managed) { return managed.window && &managed.window->presentation() == presentation; });
         return it == state.windows.end() ? nullptr : &*it;
     };
 
@@ -4141,10 +4237,13 @@ float OverviewController::effectiveAlphaHook(void* windowThisptr) {
         managed = findInState(m_state);
 
     if (!managed || !managed->window || isWindowClosePending(managed->window))
-        return originalAlpha;
+        return result;
 
-    return resolveExpandedGroupEffectiveAlpha(originalAlpha, managed->previewAlpha, isVisible(), nativeWindowRenderActive(),
-                                              static_cast<bool>(managed->group), managed->collapsedGroup);
+    const float visibleAlpha = resolveExpandedGroupEffectiveAlpha(result.alphaVisible ? 1.F : 0.F,
+        managed->previewAlphaWithoutActive * presentation->alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE),
+        isVisible(), nativeWindowRenderActive(), static_cast<bool>(managed->group), managed->collapsedGroup);
+    result.alphaVisible = visibleAlpha > 0.F;
+    return result;
 }
 
 bool OverviewController::shouldHideLayerSurface(const PHLLS& layer, const PHLMONITOR& monitor) const {
@@ -4153,18 +4252,19 @@ bool OverviewController::shouldHideLayerSurface(const PHLLS& layer, const PHLMON
 
     const auto layerMonitor = layer->m_monitor.lock();
     const auto layerResource = layer->m_layerSurface.lock();
-    if (!layerMonitor || layerMonitor != monitor || !layerResource || !layer->m_mapped || layer->m_noProcess)
+    if (!layerMonitor || layerMonitor != monitor || !layerResource || !layer->mapped() || static_cast<bool>(layer->m_flags & Desktop::View::LAYER_FLAG_DEAD))
         return false;
 
     return layerResource->m_current.exclusive > 0;
 }
 
-void OverviewController::renderLayerHook(void* rendererThisptr, PHLLS layer, PHLMONITOR monitor, const Time::steady_tp& now, bool popups, bool lockscreen) {
+void OverviewController::renderLayerHook(void* rendererThisptr, PHLLS layer, PHLMONITOR monitor, const Time::steady_tp& now, bool popups, bool lockscreen,
+                                         bool workspaceScene) {
     if (!m_renderLayerOriginal)
         return;
 
     if (nativeWindowRenderActive()) {
-        m_renderLayerOriginal(rendererThisptr, layer, monitor, now, popups, lockscreen);
+        m_renderLayerOriginal(rendererThisptr, renderContext(), layer, monitor, now, popups, lockscreen, workspaceScene);
         return;
     }
 
@@ -4175,7 +4275,7 @@ void OverviewController::renderLayerHook(void* rendererThisptr, PHLLS layer, PHL
             return;
     }
 
-    m_renderLayerOriginal(rendererThisptr, layer, monitor, now, popups, lockscreen);
+    m_renderLayerOriginal(rendererThisptr, renderContext(), layer, monitor, now, popups, lockscreen, workspaceScene);
 }
 
 double OverviewController::previewDecorationRoundingScale(const PHLMONITOR& monitor) const {
@@ -4219,31 +4319,37 @@ void OverviewController::renderOverviewBorderForRect(const PHLWINDOW& window, co
 
     const double renderScale = renderScaleForMonitor(monitor);
     const double roundingScale = previewDecorationRoundingScale(monitor);
-    const double roundingPower = window->roundingPower();
+    const double roundingPower = window->presentation().roundingPower();
     const double correctionOffset = borderSizeLogical * (M_SQRT2 - 1.0) * std::max(2.0 - roundingPower, 0.0);
-    const double innerRoundingLogical = std::max(0.0, static_cast<double>(window->rounding()) * roundingScale * decorationScale);
+    const double innerRoundingLogical = std::max(0.0, static_cast<double>(window->presentation().rounding()) * roundingScale * decorationScale);
     const int    innerRounding =
         std::min(static_cast<int>(std::floor(std::min(borderBox.width, borderBox.height) * 0.5)),
                  std::max(0, static_cast<int>(std::lround(innerRoundingLogical * renderScale))));
     const int outerRound =
         std::max(0, static_cast<int>(std::lround((innerRoundingLogical + borderSizeLogical - correctionOffset) * renderScale)));
 
-    auto       grad = window->m_realBorderColor;
-    auto       previousGrad = window->m_realBorderColorPrevious;
-    const bool animated = window->m_borderFadeAnimationProgress && window->m_borderFadeAnimationProgress->isBeingAnimated();
-    if (window->m_borderAngleAnimationProgress && window->m_borderAngleAnimationProgress->enabled()) {
-        grad.m_angle += window->m_borderAngleAnimationProgress->value() * M_PI * 2.0;
-        grad.m_angle = normalizeAngleRad(grad.m_angle);
-        if (animated)
-            previousGrad.m_angle = grad.m_angle;
+    std::optional<CAnimatedDecorationGradient::SRenderState> gradient;
+    const auto decoration = window->presentation().decoration(DECORATION_BORDER);
+    if (!decoration)
+        return;
+    {
+        DecorationGradientScope sample{gradient};
+        Render::CRenderPass discarded;
+        const auto redirect = g_pHyprRenderer->redirectPass(renderContext(), &discarded);
+        const auto presentation = window->presentation().renderPresentation();
+        if (m_borderDrawOriginal)
+            m_borderDrawOriginal(decoration.get(), renderContext(), monitor, alpha, presentation);
+        else
+            decoration->draw(renderContext(), monitor, alpha, presentation);
     }
-
+    if (!gradient)
+        return;
     CBorderPassElement::SBorderData data;
     data.box = borderBox;
-    data.grad1 = animated ? previousGrad : grad;
-    data.grad2 = grad;
-    data.hasGrad2 = animated;
-    data.lerp = animated ? window->m_borderFadeAnimationProgress->value() : 0.0F;
+    data.grad1 = gradient->transitioning ? gradient->previous : gradient->current;
+    data.grad2 = gradient->current;
+    data.hasGrad2 = gradient->transitioning;
+    data.lerp = gradient->transitioning ? gradient->progress : 0.F;
     data.a = managedPreviewAlphaFor(window, alpha);
     data.round = innerRounding;
     data.borderSize = borderSize;
@@ -4252,7 +4358,7 @@ void OverviewController::renderOverviewBorderForRect(const PHLWINDOW& window, co
     data.window = window;
 
     if (!immediate) {
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(data));
+        renderContext().m_pass.add(makeUnique<CBorderPassElement>(data));
         return;
     }
 
@@ -4264,9 +4370,9 @@ void OverviewController::renderOverviewBorderForRect(const PHLWINDOW& window, co
         .outerRound = data.outerRound,
     };
     if (data.hasGrad2)
-        g_pHyprOpenGL->renderBorder(data.box, data.grad1, data.grad2, data.lerp, renderData);
+        g_pHyprOpenGL->renderBorder(renderContext(), data.box, data.grad1, data.grad2, data.lerp, renderData);
     else
-        g_pHyprOpenGL->renderBorder(data.box, data.grad1, renderData);
+        g_pHyprOpenGL->renderBorder(renderContext(), data.box, data.grad1, renderData);
 }
 
 void OverviewController::renderOverviewShadowForWindow(const PHLWINDOW& window, const PHLMONITOR& monitor, float alpha) const {
@@ -4293,12 +4399,22 @@ void OverviewController::renderOverviewShadowForRect(const PHLWINDOW& window, co
     if (*PSHADOWS != 1)
         return;
 
-    if (!window->m_isMapped || isWindowFadingOut(window))
+    if (!window->mapped() || isWindowFadingOut(window))
         return;
     if (window->m_ruleApplicator && (!window->m_ruleApplicator->decorate().valueOrDefault() || window->m_ruleApplicator->noShadow().valueOrDefault()))
         return;
 
-    const auto& realShadowColors = window->m_realShadowColor.m_colors;
+    std::optional<CAnimatedDecorationGradient::SRenderState> gradient;
+    const auto decoration = dynamicPointerCast<CHyprDropShadowDecoration>(window->presentation().decoration(DECORATION_SHADOW));
+    if (!decoration)
+        return;
+    {
+        DecorationGradientScope sample{gradient};
+        (void)decoration->canRender(monitor);
+    }
+    if (!gradient)
+        return;
+    const auto& realShadowColors = gradient->current.m_colors;
     if (realShadowColors.empty())
         return;
     const CHyprColor shadowColor = realShadowColors.front();
@@ -4313,11 +4429,11 @@ void OverviewController::renderOverviewShadowForRect(const PHLWINDOW& window, co
     if (shadowRange <= 0.0)
         return;
 
-    const double borderSize = std::max(0.0, static_cast<double>(window->getRealBorderSize()) * decorationScale);
+    const double borderSize = std::max(0.0, static_cast<double>(window->presentation().borderSize()) * decorationScale);
     const Rect   shadowRect = inflateRect(previewRect, borderSize + shadowRange, borderSize + shadowRange);
     CBox         shadowBox = toBox(rectToMonitorRenderLocal(shadowRect, monitor)).round();
     const double renderScale = renderScaleForMonitor(monitor);
-    const float  shadowScale = std::clamp(static_cast<float>(*PSHADOWSCALE), 0.0F, 1.0F);
+    const float  shadowScale = static_cast<float>(finiteConfig(*PSHADOWSCALE, 1.0, 0.0, 1.0));
     shadowBox.scaleFromCenter(shadowScale);
     const auto shadowOffset = *PSHADOWOFFSET;
     shadowBox.translate(Vector2D{shadowOffset.x * decorationScale * renderScale, shadowOffset.y * decorationScale * renderScale});
@@ -4326,15 +4442,17 @@ void OverviewController::renderOverviewShadowForRect(const PHLWINDOW& window, co
         return;
 
     const double roundingScale = previewDecorationRoundingScale(monitor);
-    const double roundingPower = window->roundingPower();
+    const double roundingPower = window->presentation().roundingPower();
     const double correctionOffset = borderSize * (M_SQRT2 - 1.0) * std::max(2.0 - roundingPower, 0.0);
     const int    shadowRound = std::max(
-        0, static_cast<int>(std::lround((static_cast<double>(window->rounding()) * roundingScale * decorationScale + borderSize - correctionOffset) * renderScale)));
+        0, static_cast<int>(std::lround((static_cast<double>(window->presentation().rounding()) * roundingScale * decorationScale + borderSize - correctionOffset) * renderScale)));
     const int renderRange = std::max(1, static_cast<int>(std::lround(shadowRange * renderScale)));
 
-    const float previewAlpha = managedPreviewAlphaFor(window, alpha) * static_cast<float>(easeInOutCubic(visualProgress()));
+    // Desktop decorations do not disappear as the overview reaches its native
+    // endpoint. Use the window's real alpha, exactly as the border/body do.
+    const float previewAlpha = managedPreviewAlphaFor(window, alpha);
     if (immediate)
-        g_pHyprOpenGL->renderRoundedShadow(shadowBox, shadowRound, static_cast<float>(roundingPower), renderRange, shadowColor, previewAlpha);
+        g_pHyprOpenGL->renderRoundedShadow(renderContext(), shadowBox, shadowRound, static_cast<float>(roundingPower), renderRange, Config::CGradientValueData{shadowColor}, previewAlpha, window->presentation().renderPresentation());
     else {
         PHLWINDOW cutoutWindow;
         CBox cutoutSource, cutoutTarget;
@@ -4342,34 +4460,45 @@ void OverviewController::renderOverviewShadowForRect(const PHLWINDOW& window, co
         // Preserve the owner and map native shadow exclusion into the preview.
         // Stage submits this shadow outside its cropped window-content layer.
         // Other overview paths retain their existing rendering.
-        if (stageTransitionFrame(window, monitor)) {
+        if (stageTransitionFrame(window, monitor) || (TilesController::get() && TilesController::get()->enabled(monitor))) {
             cutoutWindow = window;
             cutoutSource = CBox{window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT),
                                window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)};
-            if (window->m_workspace && !window->m_pinned)
+            if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
                 cutoutSource.translate(window->m_workspace->m_renderOffset->value());
-            cutoutSource.translate(window->m_floatingOffset - monitor->m_position).scale(monitor->m_scale);
+            cutoutSource.translate(window->presentation().floatingOffset() - monitor->m_position).scale(monitor->m_scale);
             cutoutTarget = toBox(rectToMonitorRenderLocal(previewRect, monitor));
             // Match transformSurfaceRenderDataForWindow, including its size cap.
-            const int surfaceRadius = static_cast<int>(window->rounding() * monitor->m_scale);
+            const int surfaceRadius = static_cast<int>(window->presentation().rounding() * monitor->m_scale);
             const int maxRadius = std::max(0, static_cast<int>(std::floor(std::min(previewRect.width, previewRect.height) * 0.5)));
             cutoutRadius = std::min(maxRadius, std::max(0, static_cast<int>(std::lround(surfaceRadius * roundingScale))));
         }
-        g_pHyprRenderer->m_renderPass.add(makeUnique<OverviewShadowPassElement>(
+        std::optional<CBox> shadowClip;
+        if (auto* tiles=TilesController::get();workspaceScoped() && !m_stripPreviewContext.active && tiles && tiles->enabled(monitor)) {
+            const auto transition=stageTransitionFrame(window,monitor);
+            if (transition && transition->viewport.revealDecorations)
+                shadowClip=toBox(rectToMonitorRenderLocal(transition->clip,monitor));
+            else {
+                const auto tile=tiles->preferredTile(window->m_workspace,monitor);
+                for (const auto& view:tiles->views(monitor)) if (view.id==tile)
+                    shadowClip=toBox(rectToMonitorRenderLocal({view.allocation.x,view.allocation.y,view.allocation.w,view.allocation.h},monitor));
+            }
+        }
+        renderContext().m_pass.add(makeUnique<OverviewShadowPassElement>(
             shadowBox, shadowRound, static_cast<float>(roundingPower), renderRange, shadowColor, previewAlpha,
-            cutoutWindow, cutoutSource, cutoutTarget, cutoutRadius));
+            cutoutWindow, cutoutSource, cutoutTarget, cutoutRadius, shadowClip));
     }
 }
 
-void OverviewController::borderDrawHook(void* borderDecorationThisptr, const PHLMONITOR& monitor, const float& alpha) {
+void OverviewController::borderDrawHook(void* borderDecorationThisptr, const PHLMONITOR& monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
     if (!m_borderDrawOriginal) {
         return;
     }
 
-    const auto window = g_pHyprRenderer->m_renderData.currentWindow.lock();
+    const auto window = renderContext().m_data.currentWindow.lock();
     if (nativeWindowRenderActive() || !window || !monitor || !isVisible() || !ownsMonitor(monitor) || !shouldApplyOverviewTransform(window) ||
         previewMonitorForWindow(window) != monitor) {
-        m_borderDrawOriginal(borderDecorationThisptr, monitor, alpha);
+        m_borderDrawOriginal(borderDecorationThisptr, renderContext(), monitor, alpha, presentation);
         return;
     }
 
@@ -4380,54 +4509,54 @@ void OverviewController::borderDrawHook(void* borderDecorationThisptr, const PHL
 // the shader call here, where that identity is available, rather than relying
 // on the native CHyprDropShadowDecoration hook which custom decorations bypass.
 void OverviewController::customShadowHook(void* renderer, const CBox& box, int round, float power, int range,
-                                         const Config::CGradientValueData& color, float alpha) {
+                                         const Config::CGradientValueData& color, float alpha, const Render::SWindowRenderPresentation& presentation) {
     if (!m_customShadowOriginal)
         return;
-    const auto window = g_pHyprRenderer->m_renderData.currentWindow.lock();
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto window = renderContext().m_data.currentWindow.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     const auto transform = m_drawingViewflowShadow ? windowTransformFor(window, monitor) : std::nullopt;
     if (!transform) {
-        m_customShadowOriginal(renderer, box, round, power, range, color, alpha);
+        m_customShadowOriginal(renderer, renderContext(), box, round, power, range, color, alpha, presentation);
         return;
     }
     // Match Viewflow's monitor-local pixel origin, including workspace motion.
     CBox source{window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT),
                 window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)};
-    if (window->m_workspace && !window->m_pinned)
+    if (window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
         source.translate(window->m_workspace->m_renderOffset->value());
-    source.translate(window->m_floatingOffset - monitor->m_position).scale(monitor->m_scale);
+    source.translate(window->presentation().floatingOffset() - monitor->m_position).scale(monitor->m_scale);
     const auto target = toBox(rectToMonitorRenderLocal(transform->targetGlobal, monitor));
     if (source.w <= 0 || source.h <= 0 || target.w < 1 || target.h < 1)
         return;
     const double scale = std::min(target.w / source.w, target.h / source.h);
     CBox mapped = box;
     mapped.translate(-source.pos()).scale(scale).translate(target.pos());
-    m_customShadowOriginal(renderer, mapped, std::max(0, static_cast<int>(std::lround(round * scale))), power,
-                           std::max(1, static_cast<int>(std::lround(range * scale))), color, managedPreviewAlphaFor(window, alpha));
+    m_customShadowOriginal(renderer, renderContext(), mapped, std::max(0, static_cast<int>(std::lround(round * scale))), power,
+                           std::max(1, static_cast<int>(std::lround(range * scale))), color, managedPreviewAlphaFor(window, alpha), presentation);
 }
 
-void OverviewController::shadowDrawHook(void* shadowDecorationThisptr, const PHLMONITOR& monitor, const float& alpha) {
+void OverviewController::shadowDrawHook(void* shadowDecorationThisptr, const PHLMONITOR& monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
     if (!m_shadowDrawOriginal) {
         return;
     }
 
-    const auto window = g_pHyprRenderer->m_renderData.currentWindow.lock();
+    const auto window = renderContext().m_data.currentWindow.lock();
     if (nativeWindowRenderActive() || !window || !monitor || !isVisible() || !ownsMonitor(monitor) || !shouldApplyOverviewTransform(window) ||
         previewMonitorForWindow(window) != monitor) {
-        m_shadowDrawOriginal(shadowDecorationThisptr, monitor, alpha);
+        m_shadowDrawOriginal(shadowDecorationThisptr, renderContext(), monitor, alpha, presentation);
         return;
     }
 
     renderOverviewShadowForWindow(window, monitor, alpha);
 }
 
-void OverviewController::groupBarDrawHook(void* groupBarDecorationThisptr, const PHLMONITOR& monitor, const float& alpha) {
+void OverviewController::groupBarDrawHook(void* groupBarDecorationThisptr, const PHLMONITOR& monitor, const float& alpha, const Render::SWindowRenderPresentation& presentation) {
     if (!m_groupBarDrawOriginal)
         return;
 
-    const auto window = g_pHyprRenderer->m_renderData.currentWindow.lock();
+    const auto window = renderContext().m_data.currentWindow.lock();
     if (nativeWindowRenderActive() || !window || !monitor || !isVisible() || !ownsMonitor(monitor) || !hasManagedWindow(window))
-        m_groupBarDrawOriginal(groupBarDecorationThisptr, monitor, alpha);
+        m_groupBarDrawOriginal(groupBarDecorationThisptr, renderContext(), monitor, alpha, presentation);
 }
 
 void OverviewController::calculateUVForSurfaceHook(const PHLWINDOW& window, SP<CWLSurfaceResource> surface, const PHLMONITOR& monitor, bool main, const Vector2D& projSize,
@@ -4438,13 +4567,13 @@ void OverviewController::calculateUVForSurfaceHook(const PHLWINDOW& window, SP<C
     if (StageController::renderingPreview() && surface && monitor) {
         const auto logical = surface->m_current.viewport.hasDestination ? surface->m_current.viewport.destination :
             surface->m_current.viewport.hasSource ? surface->m_current.viewport.source.size() : surface->m_current.size;
-        m_calculateUVForSurfaceOriginal(g_pHyprRenderer.get(), window, std::move(surface), monitor, main,
+        m_calculateUVForSurfaceOriginal(g_pHyprRenderer->elementRenderer().get(), renderContext(), window, std::move(surface), monitor, main,
                                        (logical * monitor->m_scale).round(), logical, false);
         return;
     }
 
     if (nativeWindowRenderActive()) {
-        m_calculateUVForSurfaceOriginal(g_pHyprRenderer.get(), window, std::move(surface), monitor, main, projSize, projSizeUnscaled, fixMisalignedFSV1);
+        m_calculateUVForSurfaceOriginal(g_pHyprRenderer->elementRenderer().get(), renderContext(), window, std::move(surface), monitor, main, projSize, projSizeUnscaled, fixMisalignedFSV1);
         return;
     }
 
@@ -4453,7 +4582,7 @@ void OverviewController::calculateUVForSurfaceHook(const PHLWINDOW& window, SP<C
     bool     adjusted = false;
 
     if (isVisible() && window && surface && monitor && ownsMonitor(monitor) && shouldApplyOverviewTransform(window) && previewMonitorForWindow(window) == monitor &&
-        !window->m_isX11) {
+        !window->backend().isX11()) {
         const auto expected = expectedSurfaceSizeForUV(window, surface, monitor, main);
         if (expected && (projSize.x + 1.0 < expected->x || projSize.y + 1.0 < expected->y)) {
             adjustedProjSize = *expected;
@@ -4477,7 +4606,7 @@ void OverviewController::calculateUVForSurfaceHook(const PHLWINDOW& window, SP<C
         }
     }
 
-    m_calculateUVForSurfaceOriginal(g_pHyprRenderer.get(), window, std::move(surface), monitor, main, adjustedProjSize, adjustedProjSizeUnscaled, fixMisalignedFSV1);
+    m_calculateUVForSurfaceOriginal(g_pHyprRenderer->elementRenderer().get(), renderContext(), window, std::move(surface), monitor, main, adjustedProjSize, adjustedProjSizeUnscaled, fixMisalignedFSV1);
 }
 
 void OverviewController::rendererDrawElementHook(void* rendererThisptr, WP<IPassElement> element, const CRegion& damage) {
@@ -4502,13 +4631,13 @@ void OverviewController::rendererDrawElementHook(void* rendererThisptr, WP<IPass
         if (!isWindowFadingOut(renderData->pWindow))
             renderData->fadeAlpha = 1.0F;
 
-        m_rendererDrawElementOriginal(rendererThisptr, element, damage);
+        m_rendererDrawElementOriginal(rendererThisptr, renderContext(), element, damage);
         renderData->alpha = savedAlpha;
         renderData->fadeAlpha = savedFadeAlpha;
         return;
     }
 
-    m_rendererDrawElementOriginal(rendererThisptr, element, damage);
+    m_rendererDrawElementOriginal(rendererThisptr, renderContext(), element, damage);
 }
 
 SDispatchResult OverviewController::fullscreenDispatcherHook(std::string args) {
@@ -4520,6 +4649,9 @@ SDispatchResult OverviewController::fullscreenStateDispatcherHook(std::string ar
 }
 
 SDispatchResult OverviewController::changeWorkspaceDispatcherHook(std::string args) {
+    if (sessionLocked())
+        return m_changeWorkspaceOriginal ? m_changeWorkspaceOriginal(std::move(args)) : SDispatchResult{};
+
     if (!m_changeWorkspaceOriginal)
         return {};
 
@@ -4542,6 +4674,9 @@ SDispatchResult OverviewController::changeWorkspaceDispatcherHook(std::string ar
 }
 
 SDispatchResult OverviewController::focusWorkspaceOnCurrentMonitorDispatcherHook(std::string args) {
+    if (sessionLocked())
+        return m_focusWorkspaceOnCurrentMonitorOriginal ? m_focusWorkspaceOnCurrentMonitorOriginal(std::move(args)) : SDispatchResult{};
+
     if (!m_focusWorkspaceOnCurrentMonitorOriginal)
         return {};
 
@@ -4562,6 +4697,12 @@ SDispatchResult OverviewController::focusWorkspaceOnCurrentMonitorDispatcherHook
 }
 
 void OverviewController::workspaceSwipeBeginHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureBegin& e) {
+    if (sessionLocked()) {
+        if (m_workspaceSwipeBeginOriginal)
+            m_workspaceSwipeBeginOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (!m_workspaceSwipeBeginOriginal)
         return;
 
@@ -4586,6 +4727,12 @@ void OverviewController::workspaceSwipeBeginHook(void* gestureThisptr, const ITr
 }
 
 void OverviewController::workspaceSwipeUpdateHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (sessionLocked()) {
+        if (m_workspaceSwipeUpdateOriginal)
+            m_workspaceSwipeUpdateOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (!m_workspaceSwipeUpdateOriginal)
         return;
 
@@ -4604,6 +4751,12 @@ void OverviewController::workspaceSwipeUpdateHook(void* gestureThisptr, const IT
 }
 
 void OverviewController::workspaceSwipeEndHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureEnd& e) {
+    if (sessionLocked()) {
+        if (m_workspaceSwipeEndOriginal)
+            m_workspaceSwipeEndOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (!m_workspaceSwipeEndOriginal)
         return;
 
@@ -4621,28 +4774,40 @@ void OverviewController::workspaceSwipeEndHook(void* gestureThisptr, const ITrac
     m_workspaceSwipeEndOriginal(gestureThisptr, e);
 }
 
-void OverviewController::unifiedWorkspaceSwipeBeginHook(void* gestureThisptr) {
+bool OverviewController::unifiedWorkspaceSwipeBeginHook(void* gestureThisptr, PHLMONITOR monitor) {
     if (!m_unifiedWorkspaceSwipeBeginOriginal)
-        return;
+        return false;
+
+    if (sessionLocked())
+        return m_unifiedWorkspaceSwipeBeginOriginal(gestureThisptr, monitor);
 
     if (shouldBlockWorkspaceSwitchInOverview()) {
         if (debugLogsEnabled())
             debugLog("[hymission] block unified workspace swipe begin during multi-workspace overview");
-        return;
+        return false;
     }
 
     if (allowsWorkspaceSwitchInOverview()) {
         const auto direction = workspaceSwipeUsesVerticalAxis(activeLayoutWorkspace()) ? TRACKPAD_GESTURE_DIR_VERTICAL : TRACKPAD_GESTURE_DIR_HORIZONTAL;
         if (!beginOverviewWorkspaceSwipeGesture(direction) && debugLogsEnabled())
             debugLog("[hymission] consume unified workspace swipe begin during active-workspace overview");
-        return;
+        // Overview owns its touch/trackpad session and consumes their events.
+        // Do not let native callers record a unified session that never began.
+        return false;
     }
 
-    if (!StageController::beginWorkspaceSwipe(gestureThisptr, m_unifiedWorkspaceSwipeBeginOriginal))
-        m_unifiedWorkspaceSwipeBeginOriginal(gestureThisptr);
+    if (const auto began = StageController::beginWorkspaceSwipe(gestureThisptr, monitor, m_unifiedWorkspaceSwipeBeginOriginal))
+        return *began;
+    return m_unifiedWorkspaceSwipeBeginOriginal(gestureThisptr, monitor);
 }
 
 void OverviewController::unifiedWorkspaceSwipeUpdateHook(void* gestureThisptr, double delta) {
+    if (sessionLocked()) {
+        if (m_unifiedWorkspaceSwipeUpdateOriginal)
+            m_unifiedWorkspaceSwipeUpdateOriginal(gestureThisptr, delta);
+        return;
+    }
+
     if (!m_unifiedWorkspaceSwipeUpdateOriginal)
         return;
 
@@ -4659,6 +4824,12 @@ void OverviewController::unifiedWorkspaceSwipeUpdateHook(void* gestureThisptr, d
 }
 
 void OverviewController::unifiedWorkspaceSwipeEndHook(void* gestureThisptr) {
+    if (sessionLocked()) {
+        if (m_unifiedWorkspaceSwipeEndOriginal)
+            m_unifiedWorkspaceSwipeEndOriginal(gestureThisptr);
+        return;
+    }
+
     if (!m_unifiedWorkspaceSwipeEndOriginal)
         return;
 
@@ -4675,6 +4846,9 @@ void OverviewController::unifiedWorkspaceSwipeEndHook(void* gestureThisptr) {
 }
 
 bool OverviewController::handleTouchDown(const ITouch::SDownEvent& event) {
+    if (sessionLocked())
+        return false;
+
     if (!isVisible() || m_state.phase != Phase::Active || getConfigInt(m_handle, "gestures:workspace_swipe_touch", 0) == 0)
         return false;
 
@@ -4725,6 +4899,9 @@ bool OverviewController::handleTouchDown(const ITouch::SDownEvent& event) {
 }
 
 bool OverviewController::handleTouchMotion(const ITouch::SMotionEvent& event) {
+    if (sessionLocked())
+        return false;
+
     if (!m_workspaceSwipeGesture.active || !m_workspaceSwipeGesture.touchActive || event.touchID != m_workspaceSwipeGesture.touchId)
         return false;
 
@@ -4743,6 +4920,9 @@ bool OverviewController::handleTouchMotion(const ITouch::SMotionEvent& event) {
 }
 
 bool OverviewController::handleTouchUp(const ITouch::SUpEvent& event, bool cancelled) {
+    if (sessionLocked())
+        return false;
+
     if (!m_workspaceSwipeGesture.active || !m_workspaceSwipeGesture.touchActive || event.touchID != m_workspaceSwipeGesture.touchId)
         return false;
 
@@ -4752,6 +4932,12 @@ bool OverviewController::handleTouchUp(const ITouch::SUpEvent& event, bool cance
 }
 
 void OverviewController::scrollMoveGestureBeginHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureBegin& e) {
+    if (sessionLocked()) {
+        if (m_scrollMoveGestureBeginOriginal)
+            m_scrollMoveGestureBeginOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (m_scrollMoveGestureBeginOriginal)
         m_scrollMoveGestureBeginOriginal(gestureThisptr, e);
 
@@ -4759,6 +4945,12 @@ void OverviewController::scrollMoveGestureBeginHook(void* gestureThisptr, const 
 }
 
 void OverviewController::scrollMoveGestureUpdateHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureUpdate& e) {
+    if (sessionLocked()) {
+        if (m_scrollMoveGestureUpdateOriginal)
+            m_scrollMoveGestureUpdateOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (m_scrollMoveGestureUpdateOriginal)
         m_scrollMoveGestureUpdateOriginal(gestureThisptr, e);
 
@@ -4766,6 +4958,12 @@ void OverviewController::scrollMoveGestureUpdateHook(void* gestureThisptr, const
 }
 
 void OverviewController::scrollMoveGestureEndHook(void* gestureThisptr, const ITrackpadGesture::STrackpadGestureEnd& e) {
+    if (sessionLocked()) {
+        if (m_scrollMoveGestureEndOriginal)
+            m_scrollMoveGestureEndOriginal(gestureThisptr, e);
+        return;
+    }
+
     if (m_scrollMoveGestureEndOriginal)
         m_scrollMoveGestureEndOriginal(gestureThisptr, e);
 
@@ -4778,18 +4976,18 @@ std::vector<UP<IPassElement>> OverviewController::surfaceDrawHook(void* surfaceP
     }
 
     if (nativeWindowRenderActive() || m_surfaceRenderDataTransformDepth > 0) {
-        return m_surfaceDrawOriginal(surfacePassThisptr);
+        return m_surfaceDrawOriginal(surfacePassThisptr, renderContext());
     }
 
     CSurfacePassElement::SRenderData* renderData = nullptr;
     PHLMONITOR                        monitor;
     SurfaceRenderDataSnapshot        snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "draw", renderData, monitor, snapshot)) {
-        return m_surfaceDrawOriginal(surfacePassThisptr);
+        return m_surfaceDrawOriginal(surfacePassThisptr, renderContext());
     }
 
     ++m_surfaceRenderDataTransformDepth;
-    auto result = m_surfaceDrawOriginal(surfacePassThisptr);
+    auto result = m_surfaceDrawOriginal(surfacePassThisptr, renderContext());
     --m_surfaceRenderDataTransformDepth;
     restoreSurfaceRenderData(renderData, snapshot);
     return result;
@@ -4800,7 +4998,7 @@ bool OverviewController::surfaceNeedsLiveBlurHook(void* surfacePassThisptr) {
         return false;
 
     if (nativeWindowRenderActive())
-        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr, renderContext());
 
     if (shouldSuppressSurfaceBlur(surfacePassThisptr))
         return false;
@@ -4809,12 +5007,12 @@ bool OverviewController::surfaceNeedsLiveBlurHook(void* surfacePassThisptr) {
     auto  monitor = renderData ? renderData->pMonitor.lock() : PHLMONITOR{};
     if (!renderData || !renderData->pWindow || !monitor || !isVisible() || !ownsMonitor(monitor) || !shouldApplyOverviewTransform(renderData->pWindow) ||
         previewMonitorForWindow(renderData->pWindow) != monitor)
-        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr, renderContext());
 
     SurfaceRenderDataSnapshot snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "needsLiveBlur", renderData, monitor, snapshot))
-        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr);
-    const bool needsBlur = m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr, renderContext());
+    const bool needsBlur = m_surfaceNeedsLiveBlurOriginal(surfacePassThisptr, renderContext());
     restoreSurfaceRenderData(renderData, snapshot);
     return needsBlur;
 }
@@ -4824,7 +5022,7 @@ bool OverviewController::surfaceNeedsPrecomputeBlurHook(void* surfacePassThisptr
         return false;
 
     if (nativeWindowRenderActive())
-        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr, renderContext());
 
     if (shouldSuppressSurfaceBlur(surfacePassThisptr))
         return false;
@@ -4833,12 +5031,12 @@ bool OverviewController::surfaceNeedsPrecomputeBlurHook(void* surfacePassThisptr
     auto  monitor = renderData ? renderData->pMonitor.lock() : PHLMONITOR{};
     if (!renderData || !renderData->pWindow || !monitor || !isVisible() || !ownsMonitor(monitor) || !shouldApplyOverviewTransform(renderData->pWindow) ||
         previewMonitorForWindow(renderData->pWindow) != monitor)
-        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr, renderContext());
 
     SurfaceRenderDataSnapshot snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "needsPrecomputeBlur", renderData, monitor, snapshot))
-        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr);
-    const bool needsBlur = m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr);
+        return m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr, renderContext());
+    const bool needsBlur = m_surfaceNeedsPrecomputeBlurOriginal(surfacePassThisptr, renderContext());
     restoreSurfaceRenderData(renderData, snapshot);
     return needsBlur;
 }
@@ -4881,16 +5079,16 @@ std::optional<CBox> OverviewController::surfaceBoundingBoxHook(void* surfacePass
         return {};
 
     if (nativeWindowRenderActive() || m_surfaceRenderDataTransformDepth > 0)
-        return m_surfaceBoundingBoxOriginal(surfacePassThisptr);
+        return m_surfaceBoundingBoxOriginal(surfacePassThisptr, renderContext());
 
     CSurfacePassElement::SRenderData* renderData = nullptr;
     PHLMONITOR                        monitor;
     SurfaceRenderDataSnapshot        snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "boundingBox", renderData, monitor, snapshot))
-        return m_surfaceBoundingBoxOriginal(surfacePassThisptr);
+        return m_surfaceBoundingBoxOriginal(surfacePassThisptr, renderContext());
 
     ++m_surfaceRenderDataTransformDepth;
-    const auto box = m_surfaceBoundingBoxOriginal(surfacePassThisptr);
+    const auto box = m_surfaceBoundingBoxOriginal(surfacePassThisptr, renderContext());
     --m_surfaceRenderDataTransformDepth;
     restoreSurfaceRenderData(renderData, snapshot);
     return box;
@@ -4901,13 +5099,13 @@ CRegion OverviewController::surfaceOpaqueRegionHook(void* surfacePassThisptr) {
         return {};
 
     if (nativeWindowRenderActive() || m_surfaceRenderDataTransformDepth > 0)
-        return m_surfaceOpaqueRegionOriginal(surfacePassThisptr);
+        return m_surfaceOpaqueRegionOriginal(surfacePassThisptr, renderContext());
 
     CSurfacePassElement::SRenderData* renderData = nullptr;
     PHLMONITOR                        monitor;
     SurfaceRenderDataSnapshot        snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "opaqueRegion", renderData, monitor, snapshot))
-        return m_surfaceOpaqueRegionOriginal(surfacePassThisptr);
+        return m_surfaceOpaqueRegionOriginal(surfacePassThisptr, renderContext());
 
     // Overview already damages the full monitor while animating, and the transformed preview
     // geometry is temporary. Returning an empty opaque region avoids pass simplification
@@ -4918,7 +5116,7 @@ CRegion OverviewController::surfaceOpaqueRegionHook(void* surfacePassThisptr) {
     }
 
     ++m_surfaceRenderDataTransformDepth;
-    const CRegion region = m_surfaceOpaqueRegionOriginal(surfacePassThisptr);
+    const CRegion region = m_surfaceOpaqueRegionOriginal(surfacePassThisptr, renderContext());
     --m_surfaceRenderDataTransformDepth;
     restoreSurfaceRenderData(renderData, snapshot);
     return region;
@@ -4938,13 +5136,13 @@ CRegion OverviewController::surfaceVisibleRegionHook(void* surfacePassThisptr, b
     }
 
     if (nativeWindowRenderActive() || m_surfaceRenderDataTransformDepth > 0)
-        return m_surfaceVisibleRegionOriginal(surfacePassThisptr, cancel);
+        return m_surfaceVisibleRegionOriginal(surfacePassThisptr, renderContext(), cancel);
 
     CSurfacePassElement::SRenderData* renderData = nullptr;
     PHLMONITOR                        monitor;
     SurfaceRenderDataSnapshot        snapshot;
     if (!prepareSurfaceRenderData(surfacePassThisptr, "visibleRegion", renderData, monitor, snapshot))
-        return m_surfaceVisibleRegionOriginal(surfacePassThisptr, cancel);
+        return m_surfaceVisibleRegionOriginal(surfacePassThisptr, renderContext(), cancel);
 
     ++m_surfaceRenderDataTransformDepth;
     CBox fullBox = m_surfaceTexBoxOriginal(surfacePassThisptr);
@@ -4958,24 +5156,23 @@ CRegion OverviewController::surfaceVisibleRegionHook(void* surfacePassThisptr, b
 }
 
 LayoutConfig OverviewController::loadLayoutConfig() const {
-    const double outerPadding = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:outer_padding", 32));
-    return {
-        .engine = parseLayoutEngine(getConfigString(m_handle, "plugin:hymission:layout_engine", "grid")),
+    const double outerPadding = std::clamp(getConfigInt(m_handle, "plugin:hymission:outer_padding", 32), 0L, 4096L);
+    return normalizeLayoutConfig({
+        .engine = parseLayoutEngine(getConfigString(m_handle, "plugin:hymission:layout_engine", "natural")),
         .outerPaddingTop = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:outer_padding_top", static_cast<long>(outerPadding))),
         .outerPaddingRight = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:outer_padding_right", static_cast<long>(outerPadding))),
         .outerPaddingBottom = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:outer_padding_bottom", static_cast<long>(outerPadding))),
         .outerPaddingLeft = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:outer_padding_left", static_cast<long>(outerPadding))),
         .rowSpacing = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:row_spacing", 32)),
         .columnSpacing = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:column_spacing", 32)),
-        .smallWindowBoost = getConfigFloat(m_handle, "plugin:hymission:small_window_boost", 1.35),
-        .maxPreviewScale = getConfigFloat(m_handle, "plugin:hymission:max_preview_scale", 0.95),
+        .smallWindowBoost = getConfigFloat(m_handle, "plugin:hymission:small_window_boost", 1.35, 0.1, 4),
+        .maxPreviewScale = getConfigFloat(m_handle, "plugin:hymission:max_preview_scale", 0.95, 0, 4),
         .minWindowLength = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:min_window_length", 120)),
         .minPreviewShortEdge = static_cast<double>(getConfigInt(m_handle, "plugin:hymission:min_preview_short_edge", 32)),
-        .layoutSpaceWeight = getConfigFloat(m_handle, "plugin:hymission:layout_space_weight", 0.10),
-        .layoutScaleWeight = getConfigFloat(m_handle, "plugin:hymission:layout_scale_weight", 1.0),
-        .minSlotScale = getConfigFloat(m_handle, "plugin:hymission:min_slot_scale", 0.10),
-        .naturalScaleFlex = getConfigFloat(m_handle, "plugin:hymission:natural_scale_flex", 0.22),
-    };
+        .layoutSpaceWeight = getConfigFloat(m_handle, "plugin:hymission:layout_space_weight", 0.10, 0, 100),
+        .layoutScaleWeight = getConfigFloat(m_handle, "plugin:hymission:layout_scale_weight", 1.0, 0, 100),
+        .minSlotScale = getConfigFloat(m_handle, "plugin:hymission:min_slot_scale", 0.10, 0, 4),
+    });
 }
 
 LayoutConfig OverviewController::layoutConfigForState(const State& state) const {
@@ -5004,7 +5201,7 @@ LayoutConfig OverviewController::layoutConfigForState(const State& state) const 
     }
 
     if (state.collectionPolicy.onlyActiveWorkspace)
-        config.maxPreviewScale = getConfigFloat(m_handle, "plugin:hymission:workspace_overview_max_preview_scale", config.maxPreviewScale);
+        config.maxPreviewScale = getConfigFloat(m_handle, "plugin:hymission:workspace_overview_max_preview_scale", config.maxPreviewScale, 0, 4);
     return config;
 }
 
@@ -5042,7 +5239,7 @@ std::optional<OverviewController::ScopeOverride> OverviewController::parseScopeO
 
     if (trimmed == "onlycurrentworkspace")
         return ScopeOverride::OnlyCurrentWorkspace;
-    if (trimmed == "forceall")
+    if (trimmed == "forceall" || trimmed == "all")
         return ScopeOverride::ForceAll;
 
     error = "invalid overview scope: " + trimmed;
@@ -5060,7 +5257,7 @@ std::string OverviewController::hoverRelayoutAnimationConfig() const {
 }
 
 double OverviewController::hoverRelayoutDurationMs() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hover_relayout_duration", RELAYOUT_DURATION_MS), 0.0, 2000.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hover_relayout_duration", RELAYOUT_DURATION_MS, 0, 2000), 0.0, 2000.0);
 }
 
 HoverRelayoutCurve OverviewController::hoverRelayoutCurve() const {
@@ -5068,11 +5265,11 @@ HoverRelayoutCurve OverviewController::hoverRelayoutCurve() const {
 }
 
 double OverviewController::selectedExpandScale() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:selected_expand_scale", SELECTED_WINDOW_LAYOUT_EMPHASIS), 1.0, 2.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:selected_expand_scale", SELECTED_WINDOW_LAYOUT_EMPHASIS, 1, 2), 1.0, 2.0);
 }
 
 double OverviewController::hoverExpandScale() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hover_expand_scale", SELECTED_WINDOW_LAYOUT_EMPHASIS), 1.0, 2.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hover_expand_scale", SELECTED_WINDOW_LAYOUT_EMPHASIS, 1, 2), 1.0, 2.0);
 }
 
 bool OverviewController::focusFollowsMouseEnabled() const {
@@ -5123,7 +5320,7 @@ bool OverviewController::shouldSuppressHyprbarsPassElement(IPassElement* element
     if (!passName || std::string_view(passName) != HYPRBARS_PASS_ELEMENT_NAME)
         return false;
 
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     return monitor && ownsMonitor(monitor);
 }
 
@@ -5143,7 +5340,7 @@ bool OverviewController::shouldSuppressHyprglassPassElement(IPassElement* elemen
     if (!passName || std::string_view(passName) != HYPRGLASS_PASS_ELEMENT_NAME)
         return false;
 
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     return monitor && ownsMonitor(monitor);
 }
 
@@ -5156,15 +5353,15 @@ bool OverviewController::hideBarAnimationBlurEnabled() const {
 }
 
 double OverviewController::hideBarAnimationMoveMultiplier() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_move_multiplier", 0.8), 0.0, 2.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_move_multiplier", 0.8, 0, 2), 0.0, 2.0);
 }
 
 double OverviewController::hideBarAnimationScaleDivisor() const {
-    return std::max(1.0, getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_scale_divisor", 1.1));
+    return std::max(1.0, getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_scale_divisor", 1.1, 1, 100));
 }
 
 double OverviewController::hideBarAnimationAlphaEnd() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_alpha_end", 0.0), 0.0, 1.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:hide_bar_animation_alpha_end", 0.0, 0, 1), 0.0, 1.0);
 }
 
 bool OverviewController::barSingleMissionControlEnabled() const {
@@ -5208,11 +5405,11 @@ bool OverviewController::pickLabelsDirectActivateEnabled() const {
 }
 
 double OverviewController::focusHoverThickness() const {
-    return std::max(0.0, getConfigFloat(m_handle, "plugin:hymission:focus_hover_thickness", HOVER_THICKNESS));
+    return std::max(0.0, getConfigFloat(m_handle, "plugin:hymission:focus_hover_thickness", HOVER_THICKNESS, 0, 128));
 }
 
 double OverviewController::focusSelectedThickness() const {
-    return std::max(0.0, getConfigFloat(m_handle, "plugin:hymission:focus_selected_thickness", OUTLINE_THICKNESS));
+    return std::max(0.0, getConfigFloat(m_handle, "plugin:hymission:focus_selected_thickness", OUTLINE_THICKNESS, 0, 128));
 }
 
 bool OverviewController::backdropBlurEnabled() const {
@@ -5220,7 +5417,7 @@ bool OverviewController::backdropBlurEnabled() const {
 }
 
 CHyprColor OverviewController::backdropColor() const {
-    return getConfigColor(m_handle, "plugin:hymission:backdrop_color", 0x00000000);
+    return getConfigColor(m_handle, "plugin:hymission:backdrop_color", 0x26000000);
 }
 
 CHyprColor OverviewController::workspaceStripBackgroundColor() const {
@@ -5304,15 +5501,15 @@ bool OverviewController::niriModeEnabled() const {
 }
 
 double OverviewController::niriScrollPixelsPerDelta() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:niri_scroll_pixels_per_delta", 1.0), 0.0, 20.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:niri_scroll_pixels_per_delta", 1.0, 0, 20), 0.0, 20.0);
 }
 
 double OverviewController::niriWorkspaceScale() const {
-    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:niri_workspace_scale", 1.0), 0.05, 1.0);
+    return std::clamp(getConfigFloat(m_handle, "plugin:hymission:niri_workspace_scale", 1.0, 0.05, 1), 0.05, 1.0);
 }
 
 double OverviewController::niriScrollingPreviewGap() const {
-    return std::max(0.0, static_cast<double>(getConfigInt(m_handle, "plugin:hymission:niri_scrolling_preview_gap", 0)));
+    return std::max(0.0, static_cast<double>(getConfigInt(m_handle, "plugin:hymission:niri_scrolling_preview_gap", 24)));
 }
 
 bool OverviewController::debugLogsEnabled() const {
@@ -5357,10 +5554,10 @@ bool workspaceRowsEnabled(HANDLE handle) {
 }
 
 bool OverviewController::isScrollingWorkspace(const PHLWORKSPACE& workspace) const {
-    if (!workspace || !workspace->m_space)
+    if (!workspace || !workspace->space())
         return false;
 
-    const auto algorithm = workspace->m_space->algorithm();
+    const auto algorithm = workspace->space()->algorithm();
     if (!algorithm || !algorithm->tiledAlgo())
         return false;
 
@@ -5468,7 +5665,7 @@ bool OverviewController::scrollActiveLayoutByGestureDelta(const IPointer::SSwipe
         if (debugLogsEnabled()) {
             std::ostringstream out;
             out << "[hymission] niri layout scroll skipped: scrolling algorithm unavailable workspace="
-                << (workspace ? workspace->m_name : std::string{"<none>"});
+                << (workspace ? workspace->displayName() : std::string{"<none>"});
             debugLog(out.str());
         }
         return false;
@@ -5528,6 +5725,11 @@ bool OverviewController::scrollActiveLayoutByGestureDelta(const IPointer::SSwipe
 void OverviewController::refreshNiriScrollingOverviewAfterLayoutScroll(const char* source) {
     if (!isVisible() || m_state.phase != Phase::Active || !niriModeEnabled() || !m_state.ownerMonitor || !isScrollingWorkspace(activeLayoutWorkspace()))
         return;
+
+    if (m_state.engine == LayoutEngine::Natural || layoutConfigForState(m_state).engine == LayoutEngine::Natural) {
+        rebuildVisibleState(m_state.focusDuringOverview);
+        return;
+    }
 
     State next = buildState(m_state.ownerMonitor, m_state.collectionPolicy.requestedScope, {}, false, m_state.suppressWorkspaceStrip, m_state.focusDuringOverview);
     if (next.windows.empty())
@@ -5599,14 +5801,15 @@ double OverviewController::gestureSwipeDirectionLockThreshold() const {
 }
 
 bool OverviewController::allowsWorkspaceSwitchInOverview() const {
-    return isVisible() && m_state.collectionPolicy.onlyActiveWorkspace && workspaceChangeKeepsOverviewEnabled();
+    return !sessionLocked() && isVisible() && m_state.collectionPolicy.onlyActiveWorkspace && workspaceChangeKeepsOverviewEnabled();
 }
 
 bool OverviewController::shouldBlockWorkspaceSwitchInOverview() const {
-    return isVisible() && !m_state.collectionPolicy.onlyActiveWorkspace;
+    return !sessionLocked() && isVisible() && !m_state.collectionPolicy.onlyActiveWorkspace;
 }
 
 bool OverviewController::shouldOverrideWorkspaceNames(const State& state) const {
+    if (auto* tiles=TilesController::get(); tiles && std::ranges::any_of(state.participatingMonitors,[&](const auto& m) { return tiles->enabled(m); })) return false;
     return barSingleMissionControlEnabled() && !state.collectionPolicy.onlyActiveWorkspace;
 }
 
@@ -5664,6 +5867,7 @@ bool OverviewController::shouldContinuouslyRefreshWorkspaceStripSnapshots() cons
 }
 
 bool OverviewController::isCurrentActiveWorkspaceStripEntry(const WorkspaceStripEntry& entry) const {
+    if (entry.tileId && TilesController::get()) { const auto v=TilesController::get()->view(entry.workspace); return v && v->id==entry.tileId; }
     return entry.monitor && entry.workspace && entry.monitor->m_activeWorkspace && entry.workspace == entry.monitor->m_activeWorkspace;
 }
 
@@ -5680,7 +5884,7 @@ double OverviewController::workspaceSwipeViewportDistance(const PHLMONITOR& moni
         return 1.0;
 
     const double gaps = static_cast<double>(getConfigInt(m_handle, "general:gaps_workspaces", 0));
-    return (axis == WorkspaceTransitionAxis::Vertical ? static_cast<double>(monitor->m_size.y) : static_cast<double>(monitor->m_size.x)) + gaps;
+    return finiteConfig((axis == WorkspaceTransitionAxis::Vertical ? static_cast<double>(monitor->m_size.y) : static_cast<double>(monitor->m_size.x)) + gaps, 1.0, 1.0, 1000000.0);
 }
 
 int OverviewController::resolveOverviewWorkspaceSwipeStep(eTrackpadGestureDirection direction, double totalDelta, double lastDelta) const {
@@ -5694,7 +5898,7 @@ int OverviewController::resolveOverviewWorkspaceSwipeStep(eTrackpadGestureDirect
         adjustedLast = -adjustedLast;
     }
 
-    const double cancelRatio = std::clamp(getConfigFloat(m_handle, "gestures:workspace_swipe_cancel_ratio", 0.5), 0.0, 1.0);
+    const double cancelRatio = std::clamp(getConfigFloat(m_handle, "gestures:workspace_swipe_cancel_ratio", 0.5, 0, 1), 0.0, 1.0);
     const double distanceThreshold = gestureSwipeDistance() * cancelRatio;
     const double speedThreshold = gestureForceSpeedThreshold();
     const double decisive = std::abs(adjustedLast) >= speedThreshold ? adjustedLast : adjustedTotal;
@@ -5705,40 +5909,40 @@ int OverviewController::resolveOverviewWorkspaceSwipeStep(eTrackpadGestureDirect
     return decisive < 0.0 ? -1 : 1;
 }
 
-bool OverviewController::resolveOverviewWorkspaceTargetByStep(const PHLMONITOR& monitor, int step, WORKSPACEID& workspaceId, std::string& workspaceName,
+bool OverviewController::resolveOverviewWorkspaceTargetByStep(const PHLMONITOR& monitor, int step, WorkspaceKey& workspaceId, std::string& workspaceName,
                                                               PHLWORKSPACE& workspace, bool& syntheticEmpty) const {
     workspaceId = WORKSPACE_INVALID;
     workspaceName.clear();
     workspace.reset();
     syntheticEmpty = false;
 
-    if (!monitor || step == 0 || !monitor->m_activeWorkspace || monitor->m_activeWorkspace->m_isSpecialWorkspace)
+    if (!monitor || step == 0 || !monitor->m_activeWorkspace || (monitor->m_activeWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
     const bool        useRelative = gestureSwipeUseRelativeEnabled();
     const std::string selector = step < 0 ? (useRelative ? "r-1" : "m-1") : (useRelative ? "r+1" : "m+1");
-    auto              resolved = getWorkspaceIDNameFromString(selector);
+    auto              resolved = resolveWorkspaceKey(selector);
 
     if (resolved.id == WORKSPACE_INVALID)
         return false;
 
     workspaceId = resolved.id;
     workspaceName = resolved.name;
-    workspace = ::State::workspaceState()->query().id(workspaceId).run();
+    workspace = workspaceForKey(workspaceId);
 
-    if (step > 0 && gestureSwipeCreateNewEnabled() && (workspaceId <= monitor->m_activeWorkspace->m_id || !workspace)) {
-        auto createTarget = getWorkspaceIDNameFromString("r+1");
+    if (step > 0 && gestureSwipeCreateNewEnabled() && (workspaceId <= workspaceKey(monitor->m_activeWorkspace) || !workspace)) {
+        auto createTarget = resolveWorkspaceKey("r+1");
         if (createTarget.id == WORKSPACE_INVALID)
             return false;
 
         workspaceId = createTarget.id;
         workspaceName = createTarget.name.empty() ? std::to_string(createTarget.id) : createTarget.name;
-        workspace = ::State::workspaceState()->query().id(workspaceId).run();
+        workspace = workspaceForKey(workspaceId);
         syntheticEmpty = !workspace;
         return true;
     }
 
-    if (workspaceId == monitor->m_activeWorkspace->m_id)
+    if (workspaceId == workspaceKey(monitor->m_activeWorkspace))
         return false;
 
     if (!workspace && !gestureSwipeCreateNewEnabled())
@@ -5776,14 +5980,14 @@ void OverviewController::applyWorkspaceNameOverrides(const State& state) {
         return;
 
     const auto backupAndRename = [&](const PHLWORKSPACE& workspace, const std::string& name) {
-        if (!workspace || workspace->m_name == name)
+        if (!workspace || workspace->displayName() == name)
             return;
 
         const auto alreadyBackedUp = std::ranges::any_of(m_workspaceNameBackups, [&](const WorkspaceNameBackup& backup) { return backup.workspace == workspace; });
         if (!alreadyBackedUp) {
             m_workspaceNameBackups.push_back({
                 .workspace = workspace,
-                .name = workspace->m_name,
+                .name = workspace->displayName(),
             });
         }
 
@@ -5797,10 +6001,10 @@ void OverviewController::applyWorkspaceNameOverrides(const State& state) {
 
     if (collapseBar && primaryWorkspace) {
         for (const auto& workspace : state.managedWorkspaces) {
-            if (!workspace || workspace->m_isSpecialWorkspace || workspace == primaryWorkspace)
+            if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL) || workspace == primaryWorkspace)
                 continue;
 
-            backupAndRename(workspace, std::string{MISSION_CONTROL_HIDDEN_WORKSPACE_PREFIX} + std::to_string(workspace->m_id));
+            backupAndRename(workspace, std::string{MISSION_CONTROL_HIDDEN_WORKSPACE_PREFIX} + std::to_string(workspaceKey(workspace)));
         }
     }
 
@@ -5813,7 +6017,7 @@ void OverviewController::applyWorkspaceNameOverrides(const State& state) {
 
         if (collapseBar && primaryWorkspace && monitor->m_activeWorkspace != primaryWorkspace) {
             backupAndRename(monitor->m_activeWorkspace,
-                            std::string{MISSION_CONTROL_HIDDEN_WORKSPACE_PREFIX} + std::to_string(monitor->m_activeWorkspace->m_id));
+                            std::string{MISSION_CONTROL_HIDDEN_WORKSPACE_PREFIX} + std::to_string(workspaceKey(monitor->m_activeWorkspace)));
             continue;
         }
 
@@ -5834,7 +6038,7 @@ void OverviewController::clearRegisteredTrackpadGestures() {
 void OverviewController::rememberRegisteredTrackpadGesture(const GestureRegistration& gesture) {
     std::erase_if(m_registeredGestures, [&](const GestureRegistration& existing) {
         return existing.fingerCount == gesture.fingerCount && existing.direction == gesture.direction && existing.modMask == gesture.modMask &&
-            std::abs(existing.deltaScale - gesture.deltaScale) <= 0.0001F && existing.disableInhibit == gesture.disableInhibit;
+            existing.deltaScale == gesture.deltaScale && existing.disableInhibit == gesture.disableInhibit;
     });
     m_registeredGestures.push_back(gesture);
 }
@@ -5868,10 +6072,9 @@ void OverviewController::replaceNativeWorkspaceGestures(const char* source) {
 
 std::optional<std::string> OverviewController::handleGestureConfigHook(const std::string& keyword, const std::string& value) {
     const auto fallbackToHyprlandGesture = [&]() -> std::optional<std::string> {
-        if (!m_handleGestureOriginal)
-            return {};
-
-        return m_handleGestureOriginal(Config::mgr().get(), keyword, value);
+        // Native gesture config is Lua-only on this branch. The plugin's Lua
+        // adapter handles its own gestures; unrelated input is left alone.
+        return {};
     };
 
     const std::string trimmedKeyword = trimCopy(keyword);
@@ -5886,12 +6089,10 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
     if (tokens.size() < 3)
         return fallbackToHyprlandGesture();
 
-    std::size_t fingerCount = 0;
-    try {
-        fingerCount = static_cast<std::size_t>(std::stoul(tokens[0]));
-    } catch (const std::exception&) {
-        return fallbackToHyprlandGesture();
-    }
+    const auto parsedFingerCount = gestureFingerCount(tokens[0]);
+    if (!parsedFingerCount)
+        return std::string{"invalid gesture finger count: "} + tokens[0];
+    const std::size_t fingerCount = *parsedFingerCount;
 
     const auto direction = g_pTrackpadGestures->dirForString(tokens[1]);
     const bool axisDirection = direction == TRACKPAD_GESTURE_DIR_VERTICAL || direction == TRACKPAD_GESTURE_DIR_HORIZONTAL;
@@ -5899,23 +6100,22 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
     if (!scrollDirection)
         return fallbackToHyprlandGesture();
 
-    uint32_t    modMask = 0;
+    Input::ModifierMask modMask = Input::HL_MODIFIER_NONE;
     float       deltaScale = 1.0F;
     std::size_t actionIndex = 2;
     for (; actionIndex < tokens.size(); ++actionIndex) {
         const auto& token = tokens[actionIndex];
         if (token.starts_with("mod:")) {
             const std::string modValue = trimCopy(token.substr(4));
-            modMask = modValue.empty() ? 0 : g_pKeybindManager->stringToModMask(modValue);
+            modMask = modValue.empty() ? Input::ModifierMask{Input::HL_MODIFIER_NONE} : Keybinds::modMaskFromString(modValue);
             continue;
         }
 
         if (token.starts_with("scale:")) {
-            try {
-                deltaScale = std::stof(trimCopy(token.substr(6)));
-            } catch (const std::exception&) {
+            const auto parsedScale = gestureScale(trimCopy(token.substr(6)));
+            if (!parsedScale)
                 return std::string{"invalid gesture scale: "} + token;
-            }
+            deltaScale = *parsedScale;
             continue;
         }
 
@@ -5944,7 +6144,7 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
         if (debugLogsEnabled()) {
             std::ostringstream out;
             out << "[hymission] register workspace gesture fingers=" << fingerCount << " dir="
-                << (direction == TRACKPAD_GESTURE_DIR_HORIZONTAL ? "horizontal" : "vertical") << " scale=" << deltaScale << " modMask=" << modMask
+                << (direction == TRACKPAD_GESTURE_DIR_HORIZONTAL ? "horizontal" : "vertical") << " scale=" << deltaScale << " modMask=" << static_cast<uint32_t>(modMask)
                 << " disableInhibit=" << (disableInhibit ? 1 : 0);
             debugLog(out.str());
         }
@@ -6001,7 +6201,7 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
             std::ostringstream out;
             out << "[hymission] register niri scroll gesture fingers=" << fingerCount << " dir="
                 << (direction == TRACKPAD_GESTURE_DIR_SWIPE ? "swipe" : direction == TRACKPAD_GESTURE_DIR_HORIZONTAL ? "horizontal" : "vertical")
-                << " mode=" << trimmedDispatcherArgs << " scale=" << deltaScale << " modMask=" << modMask << " disableInhibit=" << (disableInhibit ? 1 : 0);
+                << " mode=" << trimmedDispatcherArgs << " scale=" << deltaScale << " modMask=" << static_cast<uint32_t>(modMask) << " disableInhibit=" << (disableInhibit ? 1 : 0);
             debugLog(out.str());
         }
 
@@ -6057,7 +6257,7 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
         out << "[hymission] register gesture fingers=" << fingerCount << " dir=" << (direction == TRACKPAD_GESTURE_DIR_HORIZONTAL ? "horizontal" : "vertical")
             << " dispatcher=" << dispatcher << " args=" << dispatcherArgs
             << " recommand=" << (recommand ? 1 : 0)
-            << " scale=" << deltaScale << " modMask=" << modMask << " disableInhibit=" << (disableInhibit ? 1 : 0);
+            << " scale=" << deltaScale << " modMask=" << static_cast<uint32_t>(modMask) << " disableInhibit=" << (disableInhibit ? 1 : 0);
         debugLog(out.str());
     }
 
@@ -6066,6 +6266,9 @@ std::optional<std::string> OverviewController::handleGestureConfigHook(const std
 
 bool OverviewController::beginTrackpadGesture(bool openOnly, ScopeOverride requestedScope, bool recommand, eTrackpadGestureDirection direction,
                                               const IPointer::SSwipeUpdateEvent& event, float deltaScale) {
+    if (sessionLocked())
+        return false;
+
     if (m_state.phase == Phase::Closing || m_state.phase == Phase::ClosingSettle)
         return false;
 
@@ -6213,6 +6416,9 @@ bool OverviewController::beginTrackpadGesture(bool openOnly, ScopeOverride reque
 }
 
 void OverviewController::updateTrackpadGesture(const IPointer::SSwipeUpdateEvent& event) {
+    if (sessionLocked())
+        return;
+
     if (!m_gestureSession.active)
         return;
 
@@ -6366,7 +6572,7 @@ void OverviewController::settleGestureAnimation(bool opening, double openness) {
         clearPostCloseDispatcher();
         m_state.pendingExitFocus = m_state.focusBeforeOpen;
         m_state.closeMode = m_state.focusBeforeOpen ? CloseMode::Normal : CloseMode::Abort;
-        if (m_state.focusBeforeOpen && m_state.focusBeforeOpen->m_isMapped)
+        if (m_state.focusBeforeOpen && m_state.focusBeforeOpen->mapped())
             commitOverviewExitFocus(m_state.focusBeforeOpen);
         for (auto& managed : m_state.windows)
             managed.exitGlobal = liveGlobalRectForWindow(managed.window);
@@ -6391,6 +6597,9 @@ void OverviewController::settleGestureAnimation(bool opening, double openness) {
 }
 
 void OverviewController::endTrackpadGesture(bool cancelled) {
+    if (sessionLocked())
+        return;
+
     if (!m_gestureSession.active)
         return;
 
@@ -6447,6 +6656,9 @@ void OverviewController::endTrackpadGesture(bool cancelled) {
 }
 
 bool OverviewController::beginScrollGesture(HymissionScrollMode mode, eTrackpadGestureDirection direction, const IPointer::SSwipeUpdateEvent& event, float deltaScale) {
+    if (sessionLocked())
+        return false;
+
     m_scrollGestureSession = {};
     const auto stageWorkspace = isVisible() ? std::optional<PHLWORKSPACE>{} : StageController::hoveredScrollWorkspace();
     m_scrollGestureSession.stageTarget = stageWorkspace.has_value();
@@ -6472,7 +6684,7 @@ bool OverviewController::beginScrollGesture(HymissionScrollMode mode, eTrackpadG
             << " dir=" << trackpadDirectionName(direction) << " gestureAxis=" << gestureAxisName(gestureAxisForDirection(direction))
             << " layoutDir=" << scrollingDirectionName(layoutDirection) << " layoutAxis=" << gestureAxisName(axisForScrollingLayoutDirection(layoutDirection))
             << " delta=" << vectorToString(event.delta) << " scale=" << deltaScale << " phase=" << phaseName() << " visible=" << (isVisible() ? 1 : 0)
-            << " overviewGestureActive=" << (m_gestureSession.active ? 1 : 0) << " workspace=" << (workspace ? workspace->m_name : std::string{"<none>"})
+            << " overviewGestureActive=" << (m_gestureSession.active ? 1 : 0) << " workspace=" << (workspace ? workspace->displayName() : std::string{"<none>"})
             << " workspaceScrolling=" << (isScrollingWorkspace(workspace) ? 1 : 0);
         debugLog(out.str());
     }
@@ -6531,7 +6743,7 @@ bool OverviewController::beginScrollGesture(HymissionScrollMode mode, eTrackpadG
     if (debugLogsEnabled()) {
         std::ostringstream out;
         out << "[hymission] scroll gesture accepted route=layout dir=" << trackpadDirectionName(direction) << " scale=" << deltaScale
-            << " stageTarget=" << (stageWorkspace ? 1 : 0) << " workspace=" << workspace->m_name
+            << " stageTarget=" << (stageWorkspace ? 1 : 0) << " workspace=" << workspace->displayName()
             << " suppressScrollingFollowFocus=" << (m_scrollGestureSession.restoreScrollingFollowFocus ? 1 : 0);
         debugLog(out.str());
     }
@@ -6547,6 +6759,9 @@ bool OverviewController::beginScrollGesture(HymissionScrollMode mode, eTrackpadG
 }
 
 void OverviewController::updateScrollGesture(const IPointer::SSwipeUpdateEvent& event) {
+    if (sessionLocked())
+        return;
+
     if (!m_scrollGestureSession.active)
         return;
 
@@ -6567,6 +6782,9 @@ void OverviewController::updateScrollGesture(const IPointer::SSwipeUpdateEvent& 
 }
 
 void OverviewController::endScrollGesture(bool cancelled) {
+    if (sessionLocked())
+        return;
+
     if (!m_scrollGestureSession.active)
         return;
 
@@ -6595,6 +6813,9 @@ void OverviewController::endScrollGesture(bool cancelled) {
 }
 
 bool OverviewController::beginOverviewWorkspaceSwipeGesture(eTrackpadGestureDirection direction) {
+    if (sessionLocked())
+        return false;
+
     if (!isVisible() || !allowsWorkspaceSwitchInOverview() || m_gestureSession.active || m_state.phase != Phase::Active || m_workspaceTransition.active)
         return false;
 
@@ -6620,7 +6841,7 @@ bool OverviewController::beginOverviewWorkspaceSwipeGesture(eTrackpadGestureDire
     return true;
 }
 
-bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& monitor, WORKSPACEID workspaceId, std::string workspaceName, PHLWORKSPACE workspace,
+bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& monitor, WorkspaceKey workspaceId, std::string workspaceName, PHLWORKSPACE workspace,
                                                          bool syntheticEmpty, WorkspaceTransitionMode mode) {
     if (!monitor || !isVisible() || m_state.phase != Phase::Active)
         return false;
@@ -6647,8 +6868,12 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
         managed.relayoutFromGlobal = managed.targetGlobal;
     }
 
+    uint64_t transitionTile = 0;
+    if (auto* tiles=TilesController::get();tiles && tiles->enabled(monitor) && source.collectionPolicy.onlyActiveWorkspace)
+        for (const auto& view:tiles->views(monitor)) if (view.focused) { transitionTile=view.id;break; }
     const auto anchorMonitor = m_state.ownerMonitor ? m_state.ownerMonitor : monitor;
     std::vector<WorkspaceOverride> overrides = {{
+        .tileId = transitionTile,
         .monitorId = monitor->m_id,
         .workspace = workspace,
         .workspaceId = workspaceId,
@@ -6656,7 +6881,7 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
         .syntheticEmpty = syntheticEmpty,
     }};
 
-    State target = buildState(anchorMonitor, m_state.collectionPolicy.requestedScope, overrides, true);
+    State target = buildState(anchorMonitor, m_state.collectionPolicy.requestedScope, overrides, true, false, {}, &m_state);
     if (target.participatingMonitors.empty())
         return false;
 
@@ -6681,12 +6906,13 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
     m_workspaceTransition = {
         .active = true,
         .monitor = monitor,
+        .tileId = transitionTile,
         .gestureDirection = m_workspaceSwipeGesture.direction,
         .axis = transitionAxis,
         .mode = mode,
         .distance = workspaceSwipeViewportDistance(monitor, transitionAxis),
         .delta = 0.0,
-        .step = workspaceId > monitor->m_activeWorkspace->m_id ? 1 : -1,
+        .step = workspaceId > workspaceKey(monitor->m_activeWorkspace) ? 1 : -1,
         .initialDirection = 0,
         .avgSpeed = 0.0,
         .speedPoints = 0,
@@ -6701,6 +6927,9 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
         .animationStart = {},
     };
 
+    if (transitionTile && transitionAxis==WorkspaceTransitionAxis::Horizontal)
+        for (const auto& view:TilesController::get()->views(monitor)) if (view.id==transitionTile)
+            m_workspaceTransition.distance=std::max(1.0,view.allocation.w+static_cast<double>(getConfigInt(m_handle,"general:gaps_workspaces",0)));
     if (mode == WorkspaceTransitionMode::TimedCommit)
         m_workspaceTransition.animationToDelta = static_cast<double>(m_workspaceTransition.step) * m_workspaceTransition.distance;
 
@@ -6722,12 +6951,12 @@ bool OverviewController::beginOverviewWorkspaceTransition(const PHLMONITOR& moni
 }
 
 bool OverviewController::beginExternalOverviewWorkspaceTransition(const PHLWORKSPACE& workspace) {
-    if (!workspace || workspace->m_isSpecialWorkspace || !allowsWorkspaceSwitchInOverview() || m_workspaceTransition.active || m_gestureSession.active ||
+    if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL) || !allowsWorkspaceSwitchInOverview() || m_workspaceTransition.active || m_gestureSession.active ||
         m_state.phase != Phase::Active)
         return false;
 
     const auto previousWorkspace = m_state.ownerWorkspace;
-    if (!previousWorkspace || previousWorkspace == workspace || previousWorkspace->m_isSpecialWorkspace)
+    if (!previousWorkspace || previousWorkspace == workspace || (previousWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
     auto monitor = workspace->m_monitor.lock();
@@ -6738,11 +6967,11 @@ bool OverviewController::beginExternalOverviewWorkspaceTransition(const PHLWORKS
     if (!monitor || !containsHandle(m_state.participatingMonitors, monitor) || monitor->m_activeWorkspace != workspace)
         return false;
 
-    int step = workspace->m_id > previousWorkspace->m_id ? 1 : -1;
-    if (shouldWrapWorkspaceIds(workspace->m_id, previousWorkspace->m_id))
+    int step = workspaceKey(workspace) > workspaceKey(previousWorkspace) ? 1 : -1;
+    if (shouldWrapWorkspaceIds(workspaceKey(workspace), workspaceKey(previousWorkspace)))
         step = -step;
 
-    if (!beginOverviewWorkspaceTransition(monitor, workspace->m_id, workspace->m_name, workspace, false, WorkspaceTransitionMode::TimedCommit))
+    if (!beginOverviewWorkspaceTransition(monitor, workspaceKey(workspace), workspace->displayName(), workspace, false, WorkspaceTransitionMode::TimedCommit))
         return false;
 
     m_workspaceTransition.step = step;
@@ -6772,7 +7001,7 @@ bool OverviewController::canCreateOverviewWorkspace(const PHLMONITOR& monitor) c
     // fingers or reopening overview. Hidden group members still count as
     // content; pinned windows follow the user and do not populate a workspace.
     return monitor && monitor->m_activeWorkspace && std::ranges::any_of(Desktop::viewState()->windows(), [&](const auto& window) {
-        return window && window->m_isMapped && !window->m_pinned && window->m_workspace == monitor->m_activeWorkspace;
+        return window && window->mapped() && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) && window->m_workspace == monitor->m_activeWorkspace;
     });
 }
 
@@ -6780,7 +7009,7 @@ bool OverviewController::startOverviewWorkspaceTransitionByStep(const PHLMONITOR
     if (!allowsWorkspaceSwitchInOverview() || !monitor || step == 0)
         return false;
 
-    WORKSPACEID targetId = WORKSPACE_INVALID;
+    WorkspaceKey targetId = WORKSPACE_INVALID;
     std::string targetName;
     PHLWORKSPACE targetWorkspace;
     bool syntheticEmpty = false;
@@ -6802,14 +7031,23 @@ bool OverviewController::startOverviewWorkspaceTransitionByStep(const PHLMONITOR
 }
 
 void OverviewController::updateOverviewWorkspaceSwipeGesture(double delta) {
+    if (sessionLocked())
+        return;
+
     updateOverviewWorkspaceSwipeGestureAdjusted(workspaceSwipeInvertEnabled() ? -delta : delta, false);
 }
 
 void OverviewController::setOverviewWorkspaceSwipeGestureDelta(double delta) {
+    if (sessionLocked())
+        return;
+
     updateOverviewWorkspaceSwipeGestureAdjusted(delta, true);
 }
 
 void OverviewController::updateOverviewWorkspaceSwipeGestureAdjusted(double delta, bool absolute) {
+    if (sessionLocked())
+        return;
+
     if (!m_workspaceSwipeGesture.active || !m_workspaceSwipeGesture.monitor)
         return;
 
@@ -6863,6 +7101,9 @@ void OverviewController::updateOverviewWorkspaceSwipeGestureAdjusted(double delt
 }
 
 void OverviewController::endOverviewWorkspaceSwipeGesture(bool cancelled) {
+    if (sessionLocked())
+        return;
+
     const double gestureDelta = m_workspaceSwipeGesture.progress.delta;
     const bool touchActive = m_workspaceSwipeGesture.touchActive;
     m_workspaceSwipeGesture = {};
@@ -6870,7 +7111,7 @@ void OverviewController::endOverviewWorkspaceSwipeGesture(bool cancelled) {
     if (!m_workspaceTransition.active)
         return;
 
-    const double cancelRatio = std::clamp(getConfigFloat(m_handle, "gestures:workspace_swipe_cancel_ratio", 0.5), 0.0, 1.0);
+    const double cancelRatio = std::clamp(getConfigFloat(m_handle, "gestures:workspace_swipe_cancel_ratio", 0.5, 0, 1), 0.0, 1.0);
     const double gestureDistance = gestureSwipeDistance();
     const double speedThreshold = gestureForceSpeedThreshold();
     const double visualSpeedThreshold = speedThreshold * (m_workspaceTransition.distance / gestureDistance);
@@ -6897,6 +7138,9 @@ void OverviewController::endOverviewWorkspaceSwipeGesture(bool cancelled) {
 }
 
 void OverviewController::updateOverviewWorkspaceTransition() {
+    if (sessionLocked())
+        return;
+
     if (!m_workspaceTransition.active || m_workspaceTransition.mode == WorkspaceTransitionMode::Gesture)
         return;
 
@@ -6928,10 +7172,13 @@ void OverviewController::updateOverviewWorkspaceTransition() {
 }
 
 void OverviewController::requestOverviewWorkspaceTransitionCommit(bool followGesture) {
+    if (sessionLocked())
+        return;
+
     if (!m_workspaceTransition.active)
         return;
 
-    if (!(g_pHyprOpenGL && g_pHyprRenderer->m_renderData.pMonitor)) {
+    if (!(g_pHyprOpenGL && renderContext().m_data.pMonitor)) {
         commitOverviewWorkspaceTransition(followGesture);
         return;
     }
@@ -6950,8 +7197,8 @@ void OverviewController::requestOverviewWorkspaceTransitionCommit(bool followGes
     if (debugLogsEnabled())
         debugLog("[hymission] defer overview workspace transition commit until after render");
 
-    g_pEventLoopManager->doLater([this, generation] {
-        if (g_controller != this || generation != m_workspaceTransitionCommitGeneration)
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != m_workspaceTransitionCommitGeneration)
             return;
 
         m_workspaceTransitionCommitScheduled = false;
@@ -6964,7 +7211,7 @@ void OverviewController::requestOverviewWorkspaceTransitionCommit(bool followGes
         // Workspace transition commit mutates live workspace/window ownership.
         // If a frame is still rendering, reschedule instead of tearing the render
         // state mid-frame.
-        if (g_pHyprOpenGL && g_pHyprRenderer->m_renderData.pMonitor) {
+        if (g_pHyprOpenGL && renderContext().m_data.pMonitor) {
             requestOverviewWorkspaceTransitionCommit(followGesture);
             return;
         }
@@ -6974,19 +7221,24 @@ void OverviewController::requestOverviewWorkspaceTransitionCommit(bool followGes
 }
 
 void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
+    if (sessionLocked())
+        return;
+
     if (!m_workspaceTransition.active || !m_workspaceTransition.monitor)
         return;
 
     clearPendingWindowGeometryRetry();
 
     const auto transitionMonitor = m_workspaceTransition.monitor;
-    const auto oldWorkspace = transitionMonitor->m_activeWorkspace;
+    auto oldWorkspace = transitionMonitor->m_activeWorkspace;
+    if (m_workspaceTransition.tileId && TilesController::get())
+        for (const auto& view:TilesController::get()->views(transitionMonitor)) if (view.id==m_workspaceTransition.tileId) oldWorkspace=view.workspace;
     const auto targetWorkspaceId = m_workspaceTransition.targetWorkspaceId;
     const bool targetWorkspaceSyntheticEmpty = m_workspaceTransition.targetWorkspaceSyntheticEmpty;
     const auto targetWorkspaceName = m_workspaceTransition.targetWorkspaceName;
     State      next = m_workspaceTransition.targetState;
 
-    auto targetWorkspace = ::State::workspaceState()->query().id(targetWorkspaceId).run();
+    auto targetWorkspace = workspaceForKey(targetWorkspaceId);
     if (!targetWorkspace && targetWorkspaceSyntheticEmpty) {
         // Recheck live content: windows may close or move during the gesture.
         if (!canCreateOverviewWorkspace(transitionMonitor)) {
@@ -6994,7 +7246,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
             damageOwnedMonitors();
             return;
         }
-        targetWorkspace = ::State::workspaceState()->create(targetWorkspaceId, transitionMonitor->m_id, targetWorkspaceName);
+        targetWorkspace = createWorkspaceForKey(targetWorkspaceId, transitionMonitor->m_id, targetWorkspaceName);
     }
     if (!targetWorkspace) {
         clearOverviewWorkspaceTransition();
@@ -7013,16 +7265,19 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
     {
         ScopedFlag applyingWorkspaceTransitionCommit(m_applyingWorkspaceTransitionCommit);
 
-        transitionMonitor->changeWorkspace(targetWorkspace, true, true, true);
+        if (m_workspaceTransition.tileId && TilesController::get())
+            (void)TilesController::get()->activate(transitionMonitor,m_workspaceTransition.tileId,targetWorkspace);
+        else
+            transitionMonitor->changeWorkspace(targetWorkspace, true, true, true);
 
         if (oldWorkspace && oldWorkspace != targetWorkspace) {
             for (const auto& window : Desktop::viewState()->windows()) {
-                if (!window || window->m_workspace != oldWorkspace || !window->m_pinned)
+                if (!window || window->m_workspace != oldWorkspace || !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED))
                     continue;
 
                 // Match Hyprland's native changeworkspace ordering: the monitor's
                 // active workspace flips first, then pinned windows follow.
-                window->layoutTarget()->assignToSpace(targetWorkspace->m_space);
+                window->layoutTarget()->assignToSpace(targetWorkspace->space());
             }
         }
 
@@ -7039,6 +7294,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
         if (targetWorkspaceSyntheticEmpty || !containsHandle(next.managedWorkspaces, targetWorkspace) || next.ownerWorkspace != targetWorkspace) {
             const auto rebuildMonitor = m_state.ownerMonitor ? m_state.ownerMonitor : transitionMonitor;
             const std::vector<WorkspaceOverride> overrides = {{
+                .tileId = m_workspaceTransition.tileId,
                 .monitorId = transitionMonitor->m_id,
                 .workspace = targetWorkspace,
                 .workspaceId = targetWorkspaceId,
@@ -7046,7 +7302,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
                 .syntheticEmpty = false,
             }};
 
-            if (State rebuilt = buildState(rebuildMonitor, m_state.collectionPolicy.requestedScope, overrides, true); !rebuilt.participatingMonitors.empty())
+            if (State rebuilt = buildState(rebuildMonitor, m_state.collectionPolicy.requestedScope, overrides, true, false, {}, &next); !rebuilt.participatingMonitors.empty())
                 next = std::move(rebuilt);
         }
 
@@ -7057,7 +7313,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
             // The pre-open focus lives on the workspace this monitor just left. Restoring
             // it on close would switch straight back, making empty workspaces unreachable.
             const auto leftBehind = [&](const PHLWINDOW& window) {
-                return window && window->m_workspace && window->m_workspace != targetWorkspace && !window->m_pinned &&
+                return window && window->m_workspace && window->m_workspace != targetWorkspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) &&
                     window->m_workspace->m_monitor.lock() == transitionMonitor;
             };
             if (leftBehind(next.focusBeforeOpen))
@@ -7073,6 +7329,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
         clearOverviewWorkspaceTransition(targetWorkspace);
         carryOverWorkspaceStripSnapshots(next, m_state);
         m_state = std::move(next);
+        sendSearchResultCount();
         applyWorkspaceNameOverrides(m_state);
         refreshWorkspaceStripSnapshots();
         const auto focused = Desktop::focusState()->window();
@@ -7101,7 +7358,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
                 }
                 m_state.selectedIndex = index;
                 syncFocusDuringOverviewFromSelection(false, "workspace-transition-commit");
-            } else if (focused && !focused->m_pinned && focused->m_workspace && focused->m_workspace != targetWorkspace &&
+            } else if (focused && !static_cast<bool>(focused->m_state & Desktop::View::WINDOW_STATE_PINNED) && focused->m_workspace && focused->m_workspace != targetWorkspace &&
                        focused->m_workspace->m_monitor.lock() == transitionMonitor) {
                 Desktop::focusState()->resetWindowFocus();
                 m_state.focusDuringOverview = {};
@@ -7116,7 +7373,7 @@ void OverviewController::commitOverviewWorkspaceTransition(bool followGesture) {
 
     if (debugLogsEnabled()) {
         std::ostringstream out;
-        out << "[hymission] overview workspace transition commit target=" << targetWorkspace->m_name << " followGesture=" << (followGesture ? 1 : 0);
+        out << "[hymission] overview workspace transition commit target=" << targetWorkspace->displayName() << " followGesture=" << (followGesture ? 1 : 0);
         debugLog(out.str());
     }
 
@@ -7157,7 +7414,7 @@ void OverviewController::armWorkspaceTransitionRenderState() {
     for (const auto& workspace : workspaces) {
         m_workspaceTransitionRenderStateBackups.push_back({
             .workspace = workspace,
-            .visible = workspace->m_visible,
+            .visible = workspace->visible(),
             .forceRendering = workspace->m_forceRendering,
             .renderOffsetValue = workspace->m_renderOffset->value(),
             .renderOffsetGoal = workspace->m_renderOffset->goal(),
@@ -7165,7 +7422,7 @@ void OverviewController::armWorkspaceTransitionRenderState() {
             .alphaGoal = workspace->m_alpha->goal(),
         });
 
-        workspace->m_visible = true;
+        workspace->setVisible(true);
         workspace->m_forceRendering = true;
         workspace->m_renderOffset->setValueAndWarp(Vector2D{});
         *workspace->m_renderOffset = Vector2D{};
@@ -7187,13 +7444,13 @@ void OverviewController::restoreWorkspaceTransitionRenderState(const PHLWORKSPAC
 
         if (committedWorkspace) {
             const auto workspaceMonitor = backup.workspace->m_monitor.lock();
-            const bool activeOnMonitor = workspaceMonitor && workspaceMonitor->m_activeWorkspace == backup.workspace;
+            const bool activeOnMonitor = workspaceMonitor && (workspaceMonitor->m_activeWorkspace == backup.workspace || (TilesController::get() && TilesController::get()->presented(backup.workspace)));
             const bool committed = backup.workspace == committedWorkspace;
 
-            backup.workspace->m_visible = committed || activeOnMonitor;
+            backup.workspace->setVisible(committed || activeOnMonitor);
             backup.workspace->m_forceRendering = activeOnMonitor && !committed ? backup.forceRendering : false;
 
-            if (backup.workspace->m_visible && !committed) {
+            if (backup.workspace->visible() && !committed) {
                 backup.workspace->m_renderOffset->setValueAndWarp(backup.renderOffsetValue);
                 if (backup.renderOffsetGoal != backup.renderOffsetValue)
                     *backup.workspace->m_renderOffset = backup.renderOffsetGoal;
@@ -7209,7 +7466,7 @@ void OverviewController::restoreWorkspaceTransitionRenderState(const PHLWORKSPAC
             continue;
         }
 
-        backup.workspace->m_visible = backup.visible;
+        backup.workspace->setVisible(backup.visible);
         backup.workspace->m_forceRendering = backup.forceRendering;
         backup.workspace->m_renderOffset->setValueAndWarp(backup.renderOffsetValue);
         if (backup.renderOffsetGoal != backup.renderOffsetValue)
@@ -7243,7 +7500,7 @@ void OverviewController::armOverviewRenderState(const State& state) {
     for (const auto& workspace : workspaces) {
         m_overviewRenderStateBackups.push_back({
             .workspace = workspace,
-            .visible = workspace->m_visible,
+            .visible = workspace->visible(),
             .forceRendering = workspace->m_forceRendering,
             .renderOffsetValue = workspace->m_renderOffset->value(),
             .renderOffsetGoal = workspace->m_renderOffset->goal(),
@@ -7251,7 +7508,7 @@ void OverviewController::armOverviewRenderState(const State& state) {
             .alphaGoal = workspace->m_alpha->goal(),
         });
 
-        workspace->m_visible = true;
+        workspace->setVisible(true);
         workspace->m_forceRendering = true;
         workspace->m_renderOffset->setValueAndWarp(Vector2D{});
         *workspace->m_renderOffset = Vector2D{};
@@ -7272,13 +7529,13 @@ void OverviewController::restoreOverviewRenderState() {
             continue;
 
         const auto workspaceMonitor = backup.workspace->m_monitor.lock();
-        const bool activeRegular = workspaceMonitor && workspaceMonitor->m_activeWorkspace == backup.workspace;
+        const bool activeRegular = workspaceMonitor && (workspaceMonitor->m_activeWorkspace == backup.workspace || (TilesController::get() && TilesController::get()->presented(backup.workspace)));
         const bool activeSpecial = workspaceMonitor && workspaceMonitor->m_activeSpecialWorkspace == backup.workspace;
         const bool activeOnMonitor = activeRegular || activeSpecial;
 
         // Real focus may switch workspaces while all-scope overview is open, so restore
         // visibility from the compositor's current active workspace, not the opening snapshot.
-        backup.workspace->m_visible = activeOnMonitor;
+        backup.workspace->setVisible(activeOnMonitor);
         backup.workspace->m_forceRendering = activeOnMonitor ? backup.forceRendering : false;
         backup.workspace->m_renderOffset->setValueAndWarp(Vector2D{});
         *backup.workspace->m_renderOffset = Vector2D{};
@@ -7313,19 +7570,19 @@ SDispatchResult OverviewController::startOverviewWorkspaceTransitionForDispatche
     if (!allowsWorkspaceSwitchInOverview())
         return {.success = false, .error = "overview workspace transition unavailable"};
 
-    WORKSPACEID targetId = WORKSPACE_INVALID;
+    WorkspaceKey targetId = WORKSPACE_INVALID;
     std::string targetName;
     PHLWORKSPACE targetWorkspace;
     bool syntheticEmpty = false;
 
     if (currentMonitorOnly) {
-        auto [workspaceId, workspaceName, isAutoID] = getWorkspaceIDNameFromString(args);
+        auto [workspaceId, workspaceName, isAutoID] = resolveWorkspaceKey(args);
         if (workspaceId == WORKSPACE_INVALID)
             return {.success = false, .error = "focusWorkspaceOnCurrentMonitor invalid workspace!"};
 
         targetId = workspaceId;
         targetName = workspaceName;
-        targetWorkspace = ::State::workspaceState()->query().id(targetId).run();
+        targetWorkspace = workspaceForKey(targetId);
         if (targetWorkspace && targetWorkspace->m_monitor.lock() != monitor)
             return {.success = false, .error = "focusWorkspaceOnCurrentMonitor workspace is on another monitor"};
         syntheticEmpty = !targetWorkspace;
@@ -7334,18 +7591,18 @@ SDispatchResult OverviewController::startOverviewWorkspaceTransitionForDispatche
         if (!currentWorkspace)
             return {.success = false, .error = "Last monitor not found"};
 
-        auto resolveWorkspaceToChange = [&](std::string value) -> SWorkspaceIDName {
+        auto resolveWorkspaceToChange = [&](std::string value) -> WorkspaceKeyName {
             if (!value.starts_with("previous"))
-                return getWorkspaceIDNameFromString(value);
+                return resolveWorkspaceKey(value);
 
             const bool perMonitor = value.contains("_per_monitor");
-            const auto previous = perMonitor ? Desktop::History::workspaceTracker()->previousWorkspaceIDName(currentWorkspace, monitor) :
-                                               Desktop::History::workspaceTracker()->previousWorkspaceIDName(currentWorkspace);
-            if (previous.id == -1 || previous.id == currentWorkspace->m_id)
+            const auto previous = perMonitor ? previousWorkspaceKey(currentWorkspace, monitor) :
+                                               previousWorkspaceKey(currentWorkspace);
+            if (previous.id == -1 || previous.id == workspaceKey(currentWorkspace))
                 return {.id = WORKSPACE_NOT_CHANGED};
 
-            if (const auto existing = ::State::workspaceState()->query().id(previous.id).run(); existing)
-                return {.id = existing->m_id, .name = existing->m_name};
+            if (const auto existing = workspaceForKey(previous.id); existing)
+                return {.id = workspaceKey(existing), .name = existing->displayName()};
 
             return {.id = previous.id, .name = previous.name.empty() ? std::to_string(previous.id) : previous.name};
         };
@@ -7358,16 +7615,16 @@ SDispatchResult OverviewController::startOverviewWorkspaceTransitionForDispatche
         if (resolved.id == WORKSPACE_NOT_CHANGED)
             return {};
 
-        const auto previousWorkspace = args.contains("_per_monitor") ? Desktop::History::workspaceTracker()->previousWorkspaceIDName(currentWorkspace, monitor) :
-                                                                       Desktop::History::workspaceTracker()->previousWorkspaceIDName(currentWorkspace);
-        const bool targetCurrent = resolved.id == currentWorkspace->m_id;
+        const auto previousWorkspace = args.contains("_per_monitor") ? previousWorkspaceKey(currentWorkspace, monitor) :
+                                                                       previousWorkspaceKey(currentWorkspace);
+        const bool targetCurrent = resolved.id == workspaceKey(currentWorkspace);
         if (targetCurrent && ((!*PBACKANDFORTH && !explicitPrevious) || previousWorkspace.id == -1))
             return {.success = false, .error = "Previous workspace doesn't exist"};
 
         targetId = targetCurrent ? previousWorkspace.id : resolved.id;
         targetName = targetCurrent ? (previousWorkspace.name.empty() ? std::to_string(previousWorkspace.id) : previousWorkspace.name) : resolved.name;
-        targetWorkspace = ::State::workspaceState()->query().id(targetId).run();
-        if (targetWorkspace && targetWorkspace->m_isSpecialWorkspace)
+        targetWorkspace = workspaceForKey(targetId);
+        if (targetWorkspace && (targetWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
             return {.success = false, .error = "overview workspace transition does not support special workspaces"};
         if (targetWorkspace && targetWorkspace->m_monitor.lock() != monitor)
             return {.success = false, .error = "overview workspace transition requires workspace on current monitor"};
@@ -7503,8 +7760,83 @@ void OverviewController::setAnimationsEnabledOverride(bool disable, std::optiona
     }
 }
 
+void OverviewController::releaseAllHooks() {
+    for (auto** hook : {&m_surfaceTexBoxHook, &m_surfaceBoundingBoxHook, &m_surfaceOpaqueRegionHook, &m_surfaceVisibleRegionHook, &m_surfaceDrawHook, &m_surfaceNeedsLiveBlurHook, &m_surfaceNeedsPrecomputeBlurHook, &m_shouldRenderWindowHook, &m_effectiveAlphaHook, &m_rendererDrawElementHook, &m_borderDrawHook, &m_shadowDrawHook, &m_customShadowHook, &m_groupBarDrawHook, &m_calculateUVForSurfaceHook, &m_workspaceSwipeBeginFunctionHook, &m_workspaceSwipeUpdateFunctionHook, &m_workspaceSwipeEndFunctionHook, &m_unifiedWorkspaceSwipeBeginFunctionHook, &m_unifiedWorkspaceSwipeUpdateFunctionHook, &m_unifiedWorkspaceSwipeEndFunctionHook, &m_scrollMoveGestureBeginFunctionHook, &m_scrollMoveGestureUpdateFunctionHook, &m_scrollMoveGestureEndFunctionHook, &m_decorationGradientHook, &m_renderLayerHook}) {
+        if (*hook) hooks::remove(m_handle,*hook);
+        *hook=nullptr;
+    }
+    m_surfaceTexBoxOriginal=nullptr;
+    m_surfaceBoundingBoxOriginal=nullptr;
+    m_surfaceOpaqueRegionOriginal=nullptr;
+    m_surfaceVisibleRegionOriginal=nullptr;
+    m_surfaceDrawOriginal=nullptr;
+    m_surfaceNeedsLiveBlurOriginal=nullptr;
+    m_surfaceNeedsPrecomputeBlurOriginal=nullptr;
+    m_shouldRenderWindowOriginal=nullptr;
+    m_effectiveAlphaOriginal=nullptr;
+    m_rendererDrawElementOriginal=nullptr;
+    m_renderLayerOriginal=nullptr;
+    m_borderDrawOriginal=nullptr;
+    m_shadowDrawOriginal=nullptr;
+    m_groupBarDrawOriginal=nullptr;
+    m_calculateUVForSurfaceOriginal=nullptr;
+    m_customShadowOriginal=nullptr;
+    m_workspaceSwipeBeginOriginal=nullptr;
+    m_workspaceSwipeUpdateOriginal=nullptr;
+    m_workspaceSwipeEndOriginal=nullptr;
+    m_unifiedWorkspaceSwipeBeginOriginal=nullptr;
+    m_unifiedWorkspaceSwipeUpdateOriginal=nullptr;
+    m_unifiedWorkspaceSwipeEndOriginal=nullptr;
+    m_scrollMoveGestureBeginOriginal=nullptr;
+    m_scrollMoveGestureUpdateOriginal=nullptr;
+    m_scrollMoveGestureEndOriginal=nullptr;
+    decorationGradientOriginal=nullptr;
+}
+
+bool OverviewController::initFailed(const std::string& reason) {
+    m_initError = reason;
+    releaseAllHooks();
+    actionHooks::remove(m_handle);
+    if (auto* tiles=TilesController::get()) tiles->fail(reason);
+    notify(reason, CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
+    return false;
+}
+
 bool OverviewController::installHooks() {
-    const auto activateOptionalHook = [&](CFunctionHook*& hook, auto& original, const char* label) {
+    static_assert(std::is_same_v<SurfaceGetTexBoxFn, decltype(&hkSurfaceTexBox)>);
+    static_assert(std::is_same_v<SurfaceBoundingBoxFn, decltype(&hkSurfaceBoundingBox)>);
+    static_assert(std::is_same_v<SurfaceOpaqueRegionFn, decltype(&hkSurfaceOpaqueRegion)>);
+    static_assert(std::is_same_v<SurfaceVisibleRegionFn, decltype(&hkSurfaceVisibleRegion)>);
+    static_assert(std::is_same_v<SurfaceDrawFn, decltype(&hkSurfaceDraw)>);
+    static_assert(std::is_same_v<SurfaceBlurNeedsFn, decltype(&hkSurfaceNeedsLiveBlur)>);
+    static_assert(std::is_same_v<ShouldRenderWindowFn, decltype(&hkShouldRenderWindow)>);
+    static_assert(std::is_same_v<EffectiveAlphaFn, decltype(&hkEffectiveAlpha)>);
+    static_assert(std::is_same_v<RendererDrawElementFn, decltype(&hkRendererDrawElement)>);
+    static_assert(std::is_same_v<RenderLayerFn, decltype(&hkRenderLayer)>);
+    HYMISSION_NATIVE_HOOK_ABI(RenderLayerFn, Render::IHyprRenderer, OverviewRendererMembers, renderLayer);
+    static_assert(std::is_same_v<CustomShadowFn, decltype(&hkCustomShadow)>);
+    static_assert(std::is_same_v<BorderDrawFn, decltype(&hkBorderDraw)>);
+    static_assert(std::is_same_v<CalculateUVForSurfaceFn, decltype(&hkCalculateUVForSurface)>);
+    static_assert(std::is_same_v<WorkspaceSwipeBeginFn, decltype(&hkWorkspaceSwipeBegin)>);
+    static_assert(std::is_same_v<WorkspaceSwipeUpdateFn, decltype(&hkWorkspaceSwipeUpdate)>);
+    static_assert(std::is_same_v<WorkspaceSwipeEndFn, decltype(&hkWorkspaceSwipeEnd)>);
+    static_assert(std::is_same_v<UnifiedWorkspaceSwipeBeginFn, decltype(&hkUnifiedWorkspaceSwipeBegin)>);
+    static_assert(std::is_same_v<UnifiedWorkspaceSwipeUpdateFn, decltype(&hkUnifiedWorkspaceSwipeUpdate)>);
+    static_assert(std::is_same_v<UnifiedWorkspaceSwipeEndFn, decltype(&hkUnifiedWorkspaceSwipeEnd)>);
+    static_assert(std::is_same_v<ScrollMoveGestureBeginFn, decltype(&hkScrollMoveGestureBegin)>);
+    static_assert(std::is_same_v<ScrollMoveGestureUpdateFn, decltype(&hkScrollMoveGestureUpdate)>);
+    static_assert(std::is_same_v<ScrollMoveGestureEndFn, decltype(&hkScrollMoveGestureEnd)>);
+    static_assert(std::is_same_v<BorderDrawFn, decltype(&hkShadowDraw)>);
+    static_assert(std::is_same_v<BorderDrawFn, decltype(&hkGroupBarDraw)>);
+    static_assert(std::is_same_v<SurfaceBlurNeedsFn, decltype(&hkSurfaceNeedsPrecomputeBlur)>);
+    if (!actionHooks::install(m_handle, this))
+        return initFailed("[hymission] failed to hook Config::Actions fullscreen/workspace functions");
+    if (!hookFunction("renderState", "CAnimatedDecorationGradient::renderState() const", m_decorationGradientHook,
+                      hooks::target(&hookDecorationGradient)) || !m_decorationGradientHook->hook())
+        return initFailed("[hymission] failed to hook CAnimatedDecorationGradient::renderState");
+    decorationGradientOriginal = reinterpret_cast<DecorationGradientFn>(m_decorationGradientHook->m_original);
+
+    const auto activateOptionalHook = [&](hooks::Lease*& hook, auto& original, const char* label) {
         if (!hook)
             return;
 
@@ -7514,7 +7846,7 @@ bool OverviewController::installHooks() {
                 out << "[hymission] optional hook activation failed: " << label;
                 debugLog(out.str());
             }
-            HyprlandAPI::removeFunctionHook(m_handle, hook);
+            hooks::remove(m_handle, hook);
             hook = nullptr;
             original = nullptr;
             return;
@@ -7524,114 +7856,87 @@ bool OverviewController::installHooks() {
         original = reinterpret_cast<OriginalT>(hook->m_original);
     };
 
-    if (hookFunction("handleGesture", "CConfigManager::handleGesture(", m_handleGestureHook, reinterpret_cast<void*>(&hkHandleGesture))) {
-        if (m_handleGestureHook->hook()) {
-            m_handleGestureOriginal = reinterpret_cast<HandleGestureFn>(m_handleGestureHook->m_original);
-        } else {
-            notify("[hymission] gesture config hook unavailable; dispatcher controls still work", CHyprColor(1.0, 0.65, 0.2, 1.0), 4000);
-            HyprlandAPI::removeFunctionHook(m_handle, m_handleGestureHook);
-            m_handleGestureHook = nullptr;
-            m_handleGestureOriginal = nullptr;
-        }
-    } else {
-        notify("[hymission] gesture config hook not found; dispatcher controls still work", CHyprColor(1.0, 0.65, 0.2, 1.0), 4000);
-    }
-
     if (!hookFunction("shouldRenderWindow",
                       std::vector<std::string>{
                           "Render::IHyprRenderer::shouldRenderWindow(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>)",
                           "IHyprRenderer::shouldRenderWindow(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<CMonitor>)",
                           "CHyprRenderer::shouldRenderWindow(Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<CMonitor>)"},
-                      m_shouldRenderWindowHook, reinterpret_cast<void*>(&hkShouldRenderWindow))) {
-        notify("[hymission] failed to hook shouldRenderWindow(window, monitor)", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+                      m_shouldRenderWindowHook, hooks::target(&hkShouldRenderWindow))) {
+        return initFailed("[hymission] failed to hook shouldRenderWindow(window, monitor)");
     }
 
-    if (!hookFunction("effectiveAlpha", "Desktop::View::CWindow::effectiveAlpha() const", m_effectiveAlphaHook,
-                      reinterpret_cast<void*>(&hkEffectiveAlpha))) {
-        notify("[hymission] failed to hook CWindow::effectiveAlpha for expanded groups", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("renderPresentation", "Desktop::View::CWindowPresentation::renderPresentation(Render::eSceneMode) const", m_effectiveAlphaHook,
+                      hooks::target(&hkEffectiveAlpha))) {
+        return initFailed("[hymission] failed to hook CWindow::effectiveAlpha for expanded groups");
     }
 
     (void)hookFunction("renderLayer", std::vector<std::string>{"IHyprRenderer::renderLayer(", "CHyprRenderer::renderLayer("}, m_renderLayerHook,
-                       reinterpret_cast<void*>(&hkRenderLayer));
+                       hooks::target(&hkRenderLayer));
 
     (void)hookFunction("draw",
                        std::vector<std::string>{
-                           "Render::IHyprRenderer::draw(Hyprutils::Memory::CWeakPointer<IPassElement>",
-                           "IHyprRenderer::draw(Hyprutils::Memory::CWeakPointer<IPassElement>"},
-                       m_rendererDrawElementHook, reinterpret_cast<void*>(&hkRendererDrawElement));
+                           "Render::IHyprRenderer::draw(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<IPassElement>, Hyprutils::Math::CRegion const&)",
+                           "Render::IHyprRenderer::draw(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<IPassElement>, Hyprutils::Math::CRegion const&)"},
+                       m_rendererDrawElementHook, hooks::target(&hkRendererDrawElement));
 
-    if (!hookFunction("getTexBox", "CSurfacePassElement::getTexBox(", m_surfaceTexBoxHook, reinterpret_cast<void*>(&hkSurfaceTexBox))) {
-        notify("[hymission] failed to hook getTexBox", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("getTexBox", "CSurfacePassElement::getTexBox()", m_surfaceTexBoxHook, hooks::target(&hkSurfaceTexBox))) {
+        return initFailed("[hymission] failed to hook getTexBox");
     }
 
-    if (!hookFunction("boundingBox", "CSurfacePassElement::boundingBox(", m_surfaceBoundingBoxHook, reinterpret_cast<void*>(&hkSurfaceBoundingBox))) {
-        notify("[hymission] failed to hook boundingBox", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("boundingBox", "CSurfacePassElement::boundingBox(Render::CRenderContext&)", m_surfaceBoundingBoxHook, hooks::target(&hkSurfaceBoundingBox))) {
+        return initFailed("[hymission] failed to hook boundingBox");
     }
 
-    if (!hookFunction("opaqueRegion", "CSurfacePassElement::opaqueRegion(", m_surfaceOpaqueRegionHook, reinterpret_cast<void*>(&hkSurfaceOpaqueRegion))) {
-        notify("[hymission] failed to hook opaqueRegion", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("opaqueRegion", "CSurfacePassElement::opaqueRegion(Render::CRenderContext&)", m_surfaceOpaqueRegionHook, hooks::target(&hkSurfaceOpaqueRegion))) {
+        return initFailed("[hymission] failed to hook opaqueRegion");
     }
 
-    if (!hookFunction("visibleRegion", "CSurfacePassElement::visibleRegion(", m_surfaceVisibleRegionHook, reinterpret_cast<void*>(&hkSurfaceVisibleRegion))) {
-        notify("[hymission] failed to hook visibleRegion", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("visibleRegion", "CSurfacePassElement::visibleRegion(Render::CRenderContext&, bool&)", m_surfaceVisibleRegionHook, hooks::target(&hkSurfaceVisibleRegion))) {
+        return initFailed("[hymission] failed to hook visibleRegion");
     }
 
-    if (!hookFunction("draw", "IPassElement::draw(", m_surfaceDrawHook, reinterpret_cast<void*>(&hkSurfaceDraw))) {
-        notify("[hymission] failed to hook surface draw", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("draw", "IPassElement::draw(Render::CRenderContext&)", m_surfaceDrawHook, hooks::target(&hkSurfaceDraw))) {
+        return initFailed("[hymission] failed to hook surface draw");
     }
 
-    if (!hookFunction("needsLiveBlur", "CSurfacePassElement::needsLiveBlur(", m_surfaceNeedsLiveBlurHook, reinterpret_cast<void*>(&hkSurfaceNeedsLiveBlur))) {
-        notify("[hymission] failed to hook surface needsLiveBlur", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("needsLiveBlur", "CSurfacePassElement::needsLiveBlur(Render::CRenderContext&)", m_surfaceNeedsLiveBlurHook, hooks::target(&hkSurfaceNeedsLiveBlur))) {
+        return initFailed("[hymission] failed to hook surface needsLiveBlur");
     }
 
-    if (!hookFunction("needsPrecomputeBlur", "CSurfacePassElement::needsPrecomputeBlur(", m_surfaceNeedsPrecomputeBlurHook,
-                      reinterpret_cast<void*>(&hkSurfaceNeedsPrecomputeBlur))) {
-        notify("[hymission] failed to hook surface needsPrecomputeBlur", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("needsPrecomputeBlur", "CSurfacePassElement::needsPrecomputeBlur(Render::CRenderContext&)", m_surfaceNeedsPrecomputeBlurHook,
+                      hooks::target(&hkSurfaceNeedsPrecomputeBlur))) {
+        return initFailed("[hymission] failed to hook surface needsPrecomputeBlur");
     }
 
-    if (!hookFunction("draw", "CHyprBorderDecoration::draw(", m_borderDrawHook, reinterpret_cast<void*>(&hkBorderDraw))) {
-        notify("[hymission] failed to hook border decoration draw", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("draw", "CHyprBorderDecoration::draw(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, float const&, Render::SWindowRenderPresentation const&)", m_borderDrawHook, hooks::target(&hkBorderDraw))) {
+        return initFailed("[hymission] failed to hook border decoration draw");
     }
 
-    if (!hookFunction("draw", "CHyprDropShadowDecoration::draw(", m_shadowDrawHook, reinterpret_cast<void*>(&hkShadowDraw))) {
-        notify("[hymission] failed to hook shadow decoration draw", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+    if (!hookFunction("draw", "CHyprDropShadowDecoration::draw(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, float const&, Render::SWindowRenderPresentation const&)", m_shadowDrawHook, hooks::target(&hkShadowDraw))) {
+        return initFailed("[hymission] failed to hook shadow decoration draw");
     }
 
-    if (!hookFunction("drawShadow", "CHyprGLRenderer::drawShadow(Hyprutils::Math::CBox const&, int, float, int, Config::CGradientValueData const&, float)",
-                      m_customShadowHook, reinterpret_cast<void*>(&hkCustomShadow)))
+    if (!hookFunction("drawShadow", "Render::GL::CHyprGLRenderer::drawShadow(Render::CRenderContext&, Hyprutils::Math::CBox const&, int, float, int, Config::CGradientValueData const&, float, Render::SWindowRenderPresentation const&)",
+                      m_customShadowHook, hooks::target(&hkCustomShadow)))
         debugLog("[hymission] Viewflow shadow hook unavailable");
 
-    if (!hookFunction("draw", "CHyprGroupBarDecoration::draw(", m_groupBarDrawHook, reinterpret_cast<void*>(&hkGroupBarDraw))) {
+    if (!hookFunction("draw", "CHyprGroupBarDecoration::draw(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, float const&, Render::SWindowRenderPresentation const&)", m_groupBarDrawHook, hooks::target(&hkGroupBarDraw))) {
         notify("[hymission] groupbar draw hook unavailable; grouped previews may retain the native bar", CHyprColor(1.0, 0.65, 0.2, 1.0), 4000);
     }
 
     if (!hookFunction("calculateUVForSurface",
-                      std::vector<std::string>{"IElementRenderer::calculateUVForSurface(", "CHyprRenderer::calculateUVForSurface("},
-                      m_calculateUVForSurfaceHook, reinterpret_cast<void*>(&hkCalculateUVForSurface))) {
-        notify("[hymission] failed to hook calculateUVForSurface", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+                      std::vector<std::string>{"Render::IElementRenderer::calculateUVForSurface(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>, Hyprutils::Memory::CSharedPointer<CWLSurfaceResource>, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>, bool, Hyprutils::Math::Vector2D const&, Hyprutils::Math::Vector2D const&, bool)", "CHyprRenderer::calculateUVForSurface("},
+                      m_calculateUVForSurfaceHook, hooks::target(&hkCalculateUVForSurface))) {
+        return initFailed("[hymission] failed to hook calculateUVForSurface");
     }
 
     if (!wrapDispatcher("fullscreen", m_fullscreenActiveOriginal, [this](std::string args) { return fullscreenDispatcherHook(std::move(args)); })) {
-        notify("[hymission] failed to wrap fullscreen dispatcher", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+        return initFailed("[hymission] failed to wrap fullscreen dispatcher");
     }
     m_fullscreenActiveDispatcherWrapped = true;
 
     if (!wrapDispatcher("fullscreenstate", m_fullscreenStateActiveOriginal, [this](std::string args) { return fullscreenStateDispatcherHook(std::move(args)); })) {
-        notify("[hymission] failed to wrap fullscreenstate dispatcher", CHyprColor(1.0, 0.2, 0.2, 1.0), 4000);
-        return false;
+        return initFailed("[hymission] failed to wrap fullscreenstate dispatcher");
     }
     m_fullscreenStateDispatcherWrapped = true;
 
@@ -7641,18 +7946,18 @@ bool OverviewController::installHooks() {
         "focusworkspaceoncurrentmonitor",
         m_focusWorkspaceOnCurrentMonitorOriginal,
         [this](std::string args) { return focusWorkspaceOnCurrentMonitorDispatcherHook(std::move(args)); });
-    (void)hookFunction("begin", "CWorkspaceSwipeGesture::begin(", m_workspaceSwipeBeginFunctionHook, reinterpret_cast<void*>(&hkWorkspaceSwipeBegin));
-    (void)hookFunction("update", "CWorkspaceSwipeGesture::update(", m_workspaceSwipeUpdateFunctionHook, reinterpret_cast<void*>(&hkWorkspaceSwipeUpdate));
-    (void)hookFunction("end", "CWorkspaceSwipeGesture::end(", m_workspaceSwipeEndFunctionHook, reinterpret_cast<void*>(&hkWorkspaceSwipeEnd));
-    (void)hookFunction("begin", "CUnifiedWorkspaceSwipeGesture::begin(", m_unifiedWorkspaceSwipeBeginFunctionHook,
-                       reinterpret_cast<void*>(&hkUnifiedWorkspaceSwipeBegin));
-    (void)hookFunction("update", "CUnifiedWorkspaceSwipeGesture::update(", m_unifiedWorkspaceSwipeUpdateFunctionHook,
-                       reinterpret_cast<void*>(&hkUnifiedWorkspaceSwipeUpdate));
-    (void)hookFunction("end", "CUnifiedWorkspaceSwipeGesture::end(", m_unifiedWorkspaceSwipeEndFunctionHook,
-                       reinterpret_cast<void*>(&hkUnifiedWorkspaceSwipeEnd));
-    (void)hookFunction("begin", "CScrollMoveTrackpadGesture::begin(", m_scrollMoveGestureBeginFunctionHook, reinterpret_cast<void*>(&hkScrollMoveGestureBegin));
-    (void)hookFunction("update", "CScrollMoveTrackpadGesture::update(", m_scrollMoveGestureUpdateFunctionHook, reinterpret_cast<void*>(&hkScrollMoveGestureUpdate));
-    (void)hookFunction("end", "CScrollMoveTrackpadGesture::end(", m_scrollMoveGestureEndFunctionHook, reinterpret_cast<void*>(&hkScrollMoveGestureEnd));
+    (void)hookFunction("begin", "CWorkspaceSwipeGesture::begin(ITrackpadGesture::STrackpadGestureBegin const&)", m_workspaceSwipeBeginFunctionHook, hooks::target(&hkWorkspaceSwipeBegin));
+    (void)hookFunction("update", "CWorkspaceSwipeGesture::update(ITrackpadGesture::STrackpadGestureUpdate const&)", m_workspaceSwipeUpdateFunctionHook, hooks::target(&hkWorkspaceSwipeUpdate));
+    (void)hookFunction("end", "CWorkspaceSwipeGesture::end(ITrackpadGesture::STrackpadGestureEnd const&)", m_workspaceSwipeEndFunctionHook, hooks::target(&hkWorkspaceSwipeEnd));
+    (void)hookFunction("begin", "CUnifiedWorkspaceSwipeGesture::begin(Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>)", m_unifiedWorkspaceSwipeBeginFunctionHook,
+                       hooks::target(&hkUnifiedWorkspaceSwipeBegin));
+    (void)hookFunction("update", "CUnifiedWorkspaceSwipeGesture::update(double)", m_unifiedWorkspaceSwipeUpdateFunctionHook,
+                       hooks::target(&hkUnifiedWorkspaceSwipeUpdate));
+    (void)hookFunction("end", "CUnifiedWorkspaceSwipeGesture::end()", m_unifiedWorkspaceSwipeEndFunctionHook,
+                       hooks::target(&hkUnifiedWorkspaceSwipeEnd));
+    (void)hookFunction("begin", "CScrollMoveTrackpadGesture::begin(ITrackpadGesture::STrackpadGestureBegin const&)", m_scrollMoveGestureBeginFunctionHook, hooks::target(&hkScrollMoveGestureBegin));
+    (void)hookFunction("update", "CScrollMoveTrackpadGesture::update(ITrackpadGesture::STrackpadGestureUpdate const&)", m_scrollMoveGestureUpdateFunctionHook, hooks::target(&hkScrollMoveGestureUpdate));
+    (void)hookFunction("end", "CScrollMoveTrackpadGesture::end(ITrackpadGesture::STrackpadGestureEnd const&)", m_scrollMoveGestureEndFunctionHook, hooks::target(&hkScrollMoveGestureEnd));
 
     m_shouldRenderWindowOriginal = nullptr;
     m_effectiveAlphaOriginal = nullptr;
@@ -7756,7 +8061,7 @@ bool OverviewController::activateHooks() {
         } else {
             if (debugLogsEnabled())
                 debugLog("[hymission] optional hook activation failed: renderer draw element");
-            HyprlandAPI::removeFunctionHook(m_handle, m_rendererDrawElementHook);
+            hooks::remove(m_handle, m_rendererDrawElementHook);
             m_rendererDrawElementHook = nullptr;
             m_rendererDrawElementOriginal = nullptr;
         }
@@ -7769,7 +8074,7 @@ bool OverviewController::activateHooks() {
         } else {
             if (debugLogsEnabled())
                 debugLog("[hymission] optional hook activation failed: renderLayer");
-            HyprlandAPI::removeFunctionHook(m_handle, m_renderLayerHook);
+            hooks::remove(m_handle, m_renderLayerHook);
             m_renderLayerHook = nullptr;
             m_renderLayerOriginal = nullptr;
         }
@@ -7836,54 +8141,33 @@ void OverviewController::deactivateHooks() {
     m_surfaceRenderDataTransformDepth = 0;
     m_hooksActive = false;
     StageController::setOverviewRendering(false);
-    g_pHyprRenderer->m_directScanoutBlocked = false;
+
 }
 
-bool OverviewController::hookFunction(const std::string& symbolName, const std::string& demangledNeedle, CFunctionHook*& hook, void* destination) {
+bool OverviewController::hookFunction(const std::string& symbolName, const std::string& demangledNeedle, hooks::Lease*& hook, void* destination) {
     return hookFunction(symbolName, std::vector<std::string>{demangledNeedle}, hook, destination);
 }
 
-bool OverviewController::hookFunction(const std::string& symbolName, const std::vector<std::string>& demangledNeedles, CFunctionHook*& hook, void* destination) {
+bool OverviewController::hookFunction(const std::string& symbolName, const std::vector<std::string>& demangledNeedles, hooks::Lease*& hook, void* destination) {
     void* source = findFunction(symbolName, demangledNeedles);
     if (!source)
         return false;
 
-    hook = HyprlandAPI::createFunctionHook(m_handle, source, destination);
+    hook = hooks::create(m_handle, source, destination);
     return hook != nullptr;
 }
 
 bool OverviewController::wrapDispatcher(const std::string& name, DispatcherHandler& original, DispatcherHandler replacement) {
-    if (!g_pKeybindManager)
-        return false;
-
-    const auto it = g_pKeybindManager->m_dispatchers.find(name);
-    if (it == g_pKeybindManager->m_dispatchers.end())
-        return false;
-
-    original = it->second;
-    it->second = std::move(replacement);
-    return true;
+    original = actionHooks::dispatcher(name);
+    return static_cast<bool>(original);
 }
 
 void OverviewController::restoreWrappedDispatchers() {
-    if (!g_pKeybindManager)
-        return;
-
-    const auto restore = [&](const char* name, bool& wrapped, DispatcherHandler& original) {
-        if (!wrapped)
-            return;
-
-        if (original)
-            g_pKeybindManager->m_dispatchers[name] = std::move(original);
-
-        original = nullptr;
-        wrapped = false;
-    };
-
-    restore("fullscreen", m_fullscreenActiveDispatcherWrapped, m_fullscreenActiveOriginal);
-    restore("fullscreenstate", m_fullscreenStateDispatcherWrapped, m_fullscreenStateActiveOriginal);
-    restore("workspace", m_changeWorkspaceDispatcherWrapped, m_changeWorkspaceOriginal);
-    restore("focusworkspaceoncurrentmonitor", m_focusWorkspaceOnCurrentMonitorDispatcherWrapped, m_focusWorkspaceOnCurrentMonitorOriginal);
+    m_fullscreenActiveOriginal = nullptr;
+    m_fullscreenStateActiveOriginal = nullptr;
+    m_changeWorkspaceOriginal = nullptr;
+    m_focusWorkspaceOnCurrentMonitorOriginal = nullptr;
+    actionHooks::remove(m_handle);
 }
 
 void* OverviewController::findFunction(const std::string& symbolName, const std::string& demangledNeedle) const {
@@ -7893,15 +8177,32 @@ void* OverviewController::findFunction(const std::string& symbolName, const std:
 void* OverviewController::findFunction(const std::string& symbolName, const std::vector<std::string>& demangledNeedles) const {
     const auto matches = HyprlandAPI::findFunctionsByName(m_handle, symbolName);
     for (const auto& demangledNeedle : demangledNeedles) {
-        const auto it = std::find_if(matches.begin(), matches.end(), [&](const SFunctionMatch& match) {
-            return match.demangled.find(demangledNeedle) != std::string::npos;
-        });
-
-        if (it != matches.end())
-            return it->address;
+        if (void* source=hooks::findSymbol(matches,demangledNeedle))
+            return source;
     }
 
     return nullptr;
+}
+
+void OverviewController::handleTilesChange() {
+    if (!isVisible() || m_tilesRebuild || !g_pEventLoopManager) return;
+    m_tilesRebuild=IdleTask::later([this] {
+        m_tilesRebuild.reset();
+        if ((m_state.phase!=Phase::Active && m_state.phase!=Phase::Opening) || sessionLocked()) return;
+        clearStripWindowDragState();
+        // Tile notifications also include focus changes. Reuse the opening
+        // layout unless the scene's membership or content bounds changed.
+        rebuildVisibleState(selectedWindow());
+        damageOwnedMonitors();
+    });
+}
+
+bool OverviewController::pointInWindowTile(const ManagedWindow& managed,double x,double y) const {
+    auto* tiles=TilesController::get();
+    if (!workspaceScoped() || !tiles || !tiles->enabled(managed.targetMonitor) || managed.isPinned) return true;
+    const auto id=tiles->preferredTile(managed.window->m_workspace,managed.targetMonitor);
+    for (const auto& view:tiles->views(managed.targetMonitor)) if (view.id==id) return view.allocation.containsPoint({x,y});
+    return false;
 }
 
 bool OverviewController::isAnimating() const {
@@ -7913,7 +8214,7 @@ bool OverviewController::isVisible() const {
 }
 
 bool OverviewController::shouldHandleInput() const {
-    if (captureInputSuppressed())
+    if (sessionLocked() || captureInputSuppressed())
         return false;
 
     if (m_gestureSession.active || m_workspaceTransition.active || m_workspaceSwipeGesture.active)
@@ -7948,7 +8249,7 @@ bool OverviewController::shouldSyncRealFocusDuringOverview() const {
 }
 
 bool OverviewController::insideRenderLifecycle() const {
-    return m_surfaceRenderDataTransformDepth > 0 || m_stripSnapshotRenderDepth > 0 || (g_pHyprOpenGL && g_pHyprRenderer->m_renderData.pMonitor);
+    return m_surfaceRenderDataTransformDepth > 0 || m_stripSnapshotRenderDepth > 0 || (g_pHyprOpenGL && renderContext().m_data.pMonitor);
 }
 
 bool OverviewController::ownsMonitor(const PHLMONITOR& monitor) const {
@@ -8023,23 +8324,23 @@ bool OverviewController::windowMatchesOverviewScope(const PHLWINDOW& window, con
     if (!window)
         return false;
 
-    if (!window->m_isMapped || isWindowFadingOut(window) || window->isHidden())
+    if (!window->mapped() || isWindowFadingOut(window) || window->isHidden())
         return false;
 
     if (requireUsableGeometry && !windowHasUsableStateGeometry(window))
         return false;
 
-    if (window->m_pinned) {
+    if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
         if (window->onSpecialWorkspace())
             return false;
-        return std::ranges::any_of(state.participatingMonitors, [&](const PHLMONITOR& monitor) { return monitor && window->visibleOnMonitor(monitor); });
+        return std::ranges::any_of(state.participatingMonitors, [&](const PHLMONITOR& monitor) { return monitor && window->presentation().visibleOnMonitor(monitor); });
     }
 
     if (!window->m_workspace)
         return false;
 
-    if (window->m_workspace->m_isSpecialWorkspace)
-        return state.collectionPolicy.includeSpecial && containsHandle(state.managedWorkspaces, window->m_workspace) && window->m_workspace->isVisible();
+    if ((window->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL))
+        return state.collectionPolicy.includeSpecial && containsHandle(state.managedWorkspaces, window->m_workspace) && window->m_workspace->visible();
 
     return containsHandle(state.managedWorkspaces, window->m_workspace);
 }
@@ -8078,7 +8379,7 @@ std::string OverviewController::collectionSummary(const PHLMONITOR& monitor) con
 
         ++total;
 
-        if (!window->m_workspace && !window->m_pinned) {
+        if (!window->m_workspace && !static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
             ++noWorkspace;
             continue;
         }
@@ -8088,7 +8389,7 @@ std::string OverviewController::collectionSummary(const PHLMONITOR& monitor) con
             continue;
         }
 
-        if (!window->m_isMapped) {
+        if (!window->mapped()) {
             ++unmapped;
             continue;
         }
@@ -8118,9 +8419,9 @@ std::string OverviewController::collectionSummary(const PHLMONITOR& monitor) con
             }
         }
 
-        if (window->m_pinned) {
+        if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
             const bool visibleOnAnyMonitor =
-                std::ranges::any_of(participatingMonitors, [&](const PHLMONITOR& candidate) { return candidate && window->visibleOnMonitor(candidate); });
+                std::ranges::any_of(participatingMonitors, [&](const PHLMONITOR& candidate) { return candidate && window->presentation().visibleOnMonitor(candidate); });
             if (window->onSpecialWorkspace() || !visibleOnAnyMonitor) {
                 ++workspaceMismatch;
                 continue;
@@ -8128,11 +8429,11 @@ std::string OverviewController::collectionSummary(const PHLMONITOR& monitor) con
         } else {
             bool workspaceAccepted = false;
             if (window->m_workspace) {
-                if (window->m_workspace->m_isSpecialWorkspace) {
-                    workspaceAccepted = policy.includeSpecial && window->m_workspace->isVisible();
+                if ((window->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL)) {
+                    workspaceAccepted = policy.includeSpecial && window->m_workspace->visible();
                 } else if (policy.onlyActiveWorkspace) {
                     workspaceAccepted = std::ranges::any_of(participatingMonitors, [&](const PHLMONITOR& candidate) {
-                        return candidate && candidate->m_activeWorkspace && window->m_workspace == candidate->m_activeWorkspace;
+                        return candidate && candidate->m_activeWorkspace && (window->m_workspace == candidate->m_activeWorkspace || (TilesController::get() && TilesController::get()->presented(window->m_workspace) && window->m_workspace->m_monitor==candidate));
                     });
                 } else {
                     const auto workspaceMonitor = window->m_workspace->m_monitor.lock();
@@ -8219,7 +8520,8 @@ const SpatialPickMap& OverviewController::spatialPickMapForCurrentState() const 
         canvas.height = bottom - canvas.y;
     }
 
-    if (!haveCanvas || canvas.width <= 0.0 || canvas.height <= 0.0)
+    if (!haveCanvas || !std::isfinite(canvas.x) || !std::isfinite(canvas.y) || !std::isfinite(canvas.width) ||
+        !std::isfinite(canvas.height) || canvas.width <= 0.0 || canvas.height <= 0.0)
         canvas = makeRect(0.0, 0.0, 1.0, 1.0);
 
     const auto cacheMatches = [&] {
@@ -8245,9 +8547,13 @@ const SpatialPickMap& OverviewController::spatialPickMapForCurrentState() const 
     std::vector<SpatialPickPoint> centers;
     centers.reserve(m_state.windows.size());
 
+    std::vector<std::size_t> centerIndices;
     for (const auto& managed : m_state.windows) {
         next.windows.emplace_back(managed.window);
         const Rect rect = currentPreviewRect(managed);
+        if (!std::isfinite(rect.centerX()) || !std::isfinite(rect.centerY()))
+            continue;
+        centerIndices.push_back(next.windows.size() - 1);
         centers.push_back({
             .x = std::clamp((rect.centerX() - canvas.x) / canvas.width, 0.0, 1.0),
             .y = std::clamp((rect.centerY() - canvas.y) / canvas.height, 0.0, 1.0),
@@ -8255,6 +8561,12 @@ const SpatialPickMap& OverviewController::spatialPickMapForCurrentState() const 
     }
 
     next.map = computeSpatialPickMap(centers);
+    for (auto& route : next.map.routes)
+        route.windowIndex = centerIndices[route.windowIndex];
+    for (auto& nearest : next.map.nearestWindowByKey) {
+        if (nearest)
+            nearest = centerIndices[*nearest];
+    }
     m_spatialPickCache = std::move(next);
     return m_spatialPickCache->map;
 }
@@ -8263,38 +8575,95 @@ void OverviewController::clearSpatialPickCache() {
     m_spatialPickCache.reset();
 }
 
+Rect OverviewController::monitorAvailableRect(const PHLMONITOR& monitor) const {
+    if (!monitor)
+        return {};
+    // Hiding an exclusive bar changes painting, not its reservation. Keep strip,
+    // search and previews in the same reserved-safe logical coordinate space.
+    const auto& reserved = monitor->m_reservedArea;
+    return makeRect(reserved.left(), reserved.top(),
+                    std::max(1.0, monitor->m_size.x - reserved.left() - reserved.right()),
+                    std::max(1.0, monitor->m_size.y - reserved.top() - reserved.bottom()));
+}
+
 Rect OverviewController::workspaceStripBandRectForMonitor(const PHLMONITOR& monitor, const State& state) const {
     if (!monitor || !workspaceStripEnabled(state))
         return {};
+    // Strip bands are global, including the per-tile columns. All content
+    // rectangles below are monitor-local; translate only at this boundary.
+    if (auto* tiles = TilesController::get(); tiles && tiles->enabled(monitor)) {
+        const auto views = tiles->views(monitor);
+        if (!views.empty()) {
+            const auto first = tileStripBand(monitor, views.front().id, state);
+            const auto last = tileStripBand(monitor, views.back().id, state);
+            return {first.x, first.y, last.x + last.width - first.x, first.height};
+        }
+    }
+    const auto reservation = reserveWorkspaceStripBand(monitorAvailableRect(monitor),
+        parseWorkspaceStripAnchor(workspaceStripAnchor()), workspaceStripThickness(monitor), workspaceStripGap());
+    return makeRect(reservation.band.x + monitor->m_position.x, reservation.band.y + monitor->m_position.y,
+                    reservation.band.width, reservation.band.height);
+}
 
-    const auto reservation =
-        reserveWorkspaceStripBand(makeRect(monitor->m_position.x, monitor->m_position.y, monitor->m_size.x, monitor->m_size.y),
-                                  parseWorkspaceStripAnchor(workspaceStripAnchor()), workspaceStripThickness(monitor), workspaceStripGap());
-    return makeRect(reservation.band.x, reservation.band.y, reservation.band.width, reservation.band.height);
+Rect OverviewController::overviewAvailableRectForMonitor(const PHLMONITOR& monitor, const State& state) const {
+    if (!monitor)
+        return {};
+    const Rect available = monitorAvailableRect(monitor);
+    if (!workspaceStripEnabled(state))
+        return available;
+    if (auto* tiles = TilesController::get(); tiles && tiles->enabled(monitor)) {
+        const auto band = workspaceStripBandRectForMonitor(monitor, state);
+        return contentAfterGlobalStripColumns(available, band, monitor->m_position.x, workspaceStripGap());
+    }
+    return reserveWorkspaceStripBand(available, parseWorkspaceStripAnchor(workspaceStripAnchor()),
+                                      workspaceStripThickness(monitor), workspaceStripGap()).content;
 }
 
 Rect OverviewController::overviewContentRectForMonitor(const PHLMONITOR& monitor, const State& state) const {
     if (!monitor)
         return {};
+    return reserveSearchHeader(overviewAvailableRectForMonitor(monitor, state)).content;
+}
 
-    // Subtract layer-shell exclusive zones (e.g. waybar / quickshell-dms top
-    // bars and bottom docks) so preview tiles don't render under them. The
-    // user's outer_padding_* values still apply on top of this.
-    const double reservedTop    = monitor->m_reservedArea.top();
-    const double reservedRight  = monitor->m_reservedArea.right();
-    const double reservedBottom = monitor->m_reservedArea.bottom();
-    const double reservedLeft   = monitor->m_reservedArea.left();
+std::string OverviewController::searchInputPlacement() const {
+    const auto& monitor = m_state.ownerMonitor;
+    if (!monitor)
+        return {};
+    // Both scopes share one search query across all collected workspaces. In
+    // workspace overview each visible tile reserves the same header height;
+    // the helper remains centered over their combined content area.
+    const Rect header = reserveSearchHeader(overviewAvailableRectForMonitor(monitor, m_state)).header;
+    std::ostringstream placement;
+    placement << header.x << ' ' << header.y << ' ' << header.width << ' ' << header.height << ' ' << monitor->m_name;
+    return placement.str();
+}
 
-    const Rect available = makeRect(reservedLeft, reservedTop,
-                                    std::max(1.0, monitor->m_size.x - reservedLeft - reservedRight),
-                                    std::max(1.0, monitor->m_size.y - reservedTop - reservedBottom));
-
-    if (!workspaceStripEnabled(state))
-        return available;
-
-    const auto reservation = reserveWorkspaceStripBand(available,
-                                                       parseWorkspaceStripAnchor(workspaceStripAnchor()), workspaceStripThickness(monitor), workspaceStripGap());
-    return makeRect(reservation.content.x, reservation.content.y, reservation.content.width, reservation.content.height);
+Rect OverviewController::tileStripBand(const PHLMONITOR& monitor,uint64_t tile,const State& state) const {
+    if (!tile || !TilesController::get() || !TilesController::get()->enabled(monitor)) return workspaceStripBandRectForMonitor(monitor,state);
+    const auto views=TilesController::get()->views(monitor);
+    const auto available=monitor->logicalBoxMinusReserved();
+    double narrowest=available.w;
+    for (const auto& view:views) narrowest=std::min(narrowest,view.allocation.w);
+    const double width=std::min(workspaceStripThickness(monitor),narrowest*.5/views.size());
+    for (size_t i=0;i<views.size();++i) if (views[i].id==tile)
+        return {available.x+i*width,available.y,width,available.h};
+    return {};
+}
+Rect OverviewController::tileContentRect(const PHLMONITOR& monitor,uint64_t tile,const State& state) const {
+    auto* tiles = TilesController::get();
+    if (!monitor || !tile || !tiles || !tiles->enabled(monitor))
+        return overviewContentRectForMonitor(monitor, state);
+    for (const auto& view : tiles->views(monitor)) {
+        if (view.id != tile)
+            continue;
+        const auto box = view.allocation.intersection(monitor->logicalBoxMinusReserved());
+        Rect area{box.x - monitor->m_position.x, box.y - monitor->m_position.y, box.w, box.h};
+        if (workspaceStripEnabled(state))
+            area = contentAfterGlobalStripColumns(area, workspaceStripBandRectForMonitor(monitor, state),
+                                                 monitor->m_position.x, workspaceStripGap());
+        return reserveSearchHeader(area).content;
+    }
+    return {};
 }
 
 std::vector<Rect> OverviewController::stripRects() const {
@@ -8321,11 +8690,11 @@ const OverviewController::ManagedWindow* OverviewController::managedWindowFor(co
 }
 
 const OverviewController::ManagedWindow* OverviewController::collapsedOverviewItemFor(const State& state, const PHLWINDOW& window) const {
-    if (!window || !window->m_group)
+    if (!window || !window->grouping().group())
         return nullptr;
 
     const auto it = std::find_if(state.windows.begin(), state.windows.end(), [&](const ManagedWindow& managed) {
-        return managed.collapsedGroup && managed.group && managed.group == window->m_group && managed.group->has(window);
+        return managed.collapsedGroup && managed.group && managed.group == window->grouping().group() && managed.group->has(window);
     });
     return it == state.windows.end() ? nullptr : &*it;
 }
@@ -8378,7 +8747,8 @@ PHLWINDOW OverviewController::selectedWindow() const {
 
 float OverviewController::managedPreviewAlphaFor(const PHLWINDOW& window, float fallback) const {
     const auto* managed = managedWindowFor(window);
-    float alpha = managed ? managed->previewAlpha : fallback;
+    float alpha = managed && window ? managed->previewAlphaWithoutActive *
+        std::clamp(window->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE), 0.0F, 1.0F) : fallback;
     if (managed && m_groupDragSession && m_groupDragSession->settling && m_groupDragSession->commitDrop && managed->group == m_groupDragSession->group) {
         const auto elapsed = std::chrono::steady_clock::now() - m_groupDragSession->settleStart;
         const double raw = clampUnit(static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()) /
@@ -8392,9 +8762,9 @@ PHLMONITOR OverviewController::preferredMonitorForWindow(const PHLWINDOW& window
     if (!window)
         return {};
 
-    if (window->m_pinned) {
+    if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
         for (const auto& monitor : state.participatingMonitors) {
-            if (monitor && window->visibleOnMonitor(monitor))
+            if (monitor && window->presentation().visibleOnMonitor(monitor))
                 return monitor;
         }
     }
@@ -8483,7 +8853,7 @@ bool OverviewController::shouldUseGoalGeometryForStateSnapshot(const PHLWINDOW& 
     if (!window)
         return false;
 
-    if (window->m_workspace && !window->m_workspace->isVisible())
+    if (window->m_workspace && !window->m_workspace->visible())
         return true;
 
     if (hasUsableWindowSize(window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)))
@@ -8493,16 +8863,16 @@ bool OverviewController::shouldUseGoalGeometryForStateSnapshot(const PHLWINDOW& 
 }
 
 void OverviewController::refreshWorkspaceLayoutSnapshot(const PHLWORKSPACE& workspace, bool force) const {
-    if (!workspace || !workspace->m_space)
+    if (!workspace || !workspace->space())
         return;
 
-    const bool shouldRefresh = force || !workspace->isVisible() || isScrollingWorkspace(workspace);
+    const bool shouldRefresh = force || !workspace->visible() || isScrollingWorkspace(workspace);
     if (!shouldRefresh)
         return;
 
     if (debugLogsEnabled()) {
         std::ostringstream out;
-        out << "[hymission] refresh workspace layout snapshot workspace=" << debugWorkspaceLabel(workspace) << " visible=" << (workspace->isVisible() ? 1 : 0)
+        out << "[hymission] refresh workspace layout snapshot workspace=" << debugWorkspaceLabel(workspace) << " visible=" << (workspace->visible() ? 1 : 0)
             << " scrolling=" << (isScrollingWorkspace(workspace) ? 1 : 0) << " force=" << (force ? 1 : 0);
         debugLog(out.str());
     }
@@ -8519,11 +8889,11 @@ void OverviewController::refreshWorkspaceLayoutSnapshot(const PHLWORKSPACE& work
         }
     }
 
-    workspace->m_space->recalculate();
+    workspace->space()->recalculate();
 }
 
 std::optional<Vector2D> OverviewController::predictedScrollingExitTranslation(const PHLWINDOW& window) const {
-    if (!window || !window->m_isMapped || !window->m_workspace || !window->m_workspace->m_space || !isScrollingWorkspace(window->m_workspace))
+    if (!window || !window->mapped() || !window->m_workspace || !window->m_workspace->space() || !isScrollingWorkspace(window->m_workspace))
         return std::nullopt;
 
     const auto target = window->layoutTarget();
@@ -8536,7 +8906,7 @@ std::optional<Vector2D> OverviewController::predictedScrollingExitTranslation(co
         direction = workspaceRule.m_layoutopts.at("direction");
 
     const bool vertical = direction == "down" || direction == "up";
-    const auto workArea = window->m_workspace->m_space->workArea();
+    const auto workArea = window->m_workspace->space()->workArea();
     const auto targetBox = target->position();
 
     const double viewStart = vertical ? workArea.y : workArea.x;
@@ -8561,7 +8931,7 @@ std::optional<Vector2D> OverviewController::predictedScrollingExitTranslation(co
 }
 
 PHLWORKSPACE OverviewController::activeWorkspaceForAnimationEndpoint(const ManagedWindow& window, const PHLWORKSPACE& activeWorkspaceOverride) const {
-    if (activeWorkspaceOverride && !activeWorkspaceOverride->m_isSpecialWorkspace && window.targetMonitor) {
+    if (activeWorkspaceOverride && !(activeWorkspaceOverride->type() == Workspace::eWorkspaceType::SPECIAL) && window.targetMonitor) {
         const auto overrideMonitor = activeWorkspaceOverride->m_monitor.lock();
         if (overrideMonitor && overrideMonitor == window.targetMonitor)
             return activeWorkspaceOverride;
@@ -8587,11 +8957,15 @@ bool OverviewController::shouldUseOffscreenAnimationEndpoint(const ManagedWindow
         return false;
 
     const auto workspace = window.window->m_workspace;
-    if (!workspace || workspace->m_isSpecialWorkspace)
+    if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
+        return false;
+    // A second tile's desktop is already on screen even though the physical
+    // monitor has a different m_activeWorkspace. Keep its real scene endpoint.
+    if (auto* tiles=TilesController::get();tiles && tiles->presented(workspace))
         return false;
 
     const auto activeWorkspace = activeWorkspaceForAnimationEndpoint(window, activeWorkspaceOverride);
-    if (!activeWorkspace || activeWorkspace->m_isSpecialWorkspace)
+    if (!activeWorkspace || (activeWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
     return workspace != activeWorkspace;
@@ -8601,15 +8975,27 @@ Rect OverviewController::offscreenAnimationEndpointFor(const ManagedWindow& wind
     if (!window.targetMonitor)
         return baseRect;
 
-    const Rect bounds = makeRect(window.targetMonitor->m_position.x, window.targetMonitor->m_position.y, window.targetMonitor->m_size.x, window.targetMonitor->m_size.y);
+    Rect bounds = makeRect(window.targetMonitor->m_position.x, window.targetMonitor->m_position.y, window.targetMonitor->m_size.x, window.targetMonitor->m_size.y);
+    if (auto* tiles=TilesController::get();tiles && tiles->enabled(window.targetMonitor)) {
+        const auto id=tiles->preferredTile(window.window?window.window->m_workspace:nullptr,window.targetMonitor);
+        for (const auto& view:tiles->views(window.targetMonitor)) if (view.id==id)
+            bounds={view.allocation.x,view.allocation.y,view.allocation.w,view.allocation.h};
+    }
     if (bounds.width <= 1.0 || bounds.height <= 1.0)
         return baseRect;
+
+    if (window.window && !window.isFloating && scrollingAlgorithmForWorkspace(window.window->m_workspace)) {
+        const auto& layout=window.naturalGlobal;
+        if (layout.x+layout.width<=bounds.x || layout.x>=bounds.x+bounds.width)
+            return {layout.x+layout.width<=bounds.x?bounds.x-baseRect.width:bounds.x+bounds.width,
+                    layout.y,baseRect.width,baseRect.height};
+    }
 
     Vector2D direction;
     const auto workspace = window.window ? window.window->m_workspace : PHLWORKSPACE{};
     const auto activeWorkspace = activeWorkspaceForAnimationEndpoint(window, activeWorkspaceOverride);
-    if (workspace && activeWorkspace && !workspace->m_isSpecialWorkspace && !activeWorkspace->m_isSpecialWorkspace && workspace->m_id >= 0 && activeWorkspace->m_id >= 0) {
-        const bool incomingFromHighSide = shouldWrapWorkspaceIds(workspace->m_id, activeWorkspace->m_id) ^ (workspace->m_id > activeWorkspace->m_id);
+    if (workspace && activeWorkspace && !(workspace->type() == Workspace::eWorkspaceType::SPECIAL) && !(activeWorkspace->type() == Workspace::eWorkspaceType::SPECIAL) && workspaceKey(workspace) >= 0 && workspaceKey(activeWorkspace) >= 0) {
+        const bool incomingFromHighSide = shouldWrapWorkspaceIds(workspaceKey(workspace), workspaceKey(activeWorkspace)) ^ (workspaceKey(workspace) > workspaceKey(activeWorkspace));
         direction = predictedWorkspaceAnimationOffset(m_handle, window.targetMonitor, workspace, incomingFromHighSide, true);
         if (std::hypot(direction.x, direction.y) <= 1.0)
             direction = Vector2D{incomingFromHighSide ? 1.0 : -1.0, 0.0};
@@ -8643,7 +9029,7 @@ void OverviewController::applyOffscreenExitAnimationEndpoints(State& state, cons
     for (auto& window : state.windows) {
         window.stageClosingEndpoint.reset();
         if (const auto destination = StageController::overviewDestination(window.window, activeWorkspaceOverride, window.exitGlobal)) {
-            if (stage::overviewEndpointVisible(*destination)) {
+            if (stage::overviewEndpointVisible(*destination) || destination->viewport.revealDecorations) {
                 window.exitGlobal = destination->window;
                 window.stageClosingEndpoint = destination;
             } else
@@ -8666,7 +9052,7 @@ void OverviewController::prepareGestureCloseExitGeometry() {
     const auto currentWorkspaceOnTargetMonitor = predictedExitMonitor ? predictedExitMonitor->m_activeWorkspace : PHLWORKSPACE{};
     const auto scrollingTranslation = predictedScrollingExitTranslation(predictedExitFocus);
     const bool workspaceSwitchOnExit =
-        predictedExitWorkspace && predictedExitMonitor && !predictedExitWorkspace->m_isSpecialWorkspace && currentWorkspaceOnTargetMonitor &&
+        predictedExitWorkspace && predictedExitMonitor && !(predictedExitWorkspace->type() == Workspace::eWorkspaceType::SPECIAL) && currentWorkspaceOnTargetMonitor &&
         predictedExitWorkspace != currentWorkspaceOnTargetMonitor;
 
     if (debugLogsEnabled()) {
@@ -8678,9 +9064,9 @@ void OverviewController::prepareGestureCloseExitGeometry() {
             out << " target=<null>";
         out << " workspaceSwitch=" << (workspaceSwitchOnExit ? 1 : 0);
         if (currentWorkspaceOnTargetMonitor)
-            out << " currentWorkspace=" << currentWorkspaceOnTargetMonitor->m_id;
+            out << " currentWorkspace=" << workspaceKey(currentWorkspaceOnTargetMonitor);
         if (predictedExitWorkspace)
-            out << " targetWorkspace=" << predictedExitWorkspace->m_id;
+            out << " targetWorkspace=" << workspaceKey(predictedExitWorkspace);
         if (scrollingTranslation)
             out << " scrollingDelta=" << vectorToString(*scrollingTranslation);
         else
@@ -8700,7 +9086,7 @@ void OverviewController::prepareGestureCloseExitGeometry() {
             }
         }
 
-        if (!scrollingTranslation || !predictedExitFocus || !managed.window || !managed.window->m_isMapped)
+        if (!scrollingTranslation || !predictedExitFocus || !managed.window || !managed.window->mapped())
             continue;
 
         if (managed.window->m_workspace != predictedExitFocus->m_workspace)
@@ -8720,8 +9106,8 @@ double OverviewController::overviewBorderOutsetForWindow(const PHLWINDOW& window
     if (!windowDecorationsEnabled() || !window)
         return 0.0;
 
-    const int borderSize = window->getRealBorderSize();
-    if (borderSize <= 0 || window->m_X11DoesntWantBorders || Fullscreen::controller()->getFullscreenModes(window).internal == Fullscreen::FSMODE_FULLSCREEN)
+    const int borderSize = window->presentation().borderSize();
+    if (borderSize <= 0 || window->backend().traits().suggestsNoBorder || Fullscreen::controller()->getFullscreenModes(window).internal == Fullscreen::FSMODE_FULLSCREEN)
         return 0.0;
     if (window->m_ruleApplicator && !window->m_ruleApplicator->decorate().valueOrDefault())
         return 0.0;
@@ -8847,6 +9233,8 @@ double OverviewController::hiddenStripLayerProgress(const PHLLS& layer, const PH
 }
 
 void OverviewController::clearHiddenStripLayerProxies() {
+    cancelAndClearTimer(m_hiddenStripProxyRefreshTimer);
+    m_hiddenStripProxyRefresh.reset();
     m_hiddenStripLayerProxies.clear();
 }
 
@@ -8863,6 +9251,11 @@ const OverviewController::HiddenStripLayerProxy* OverviewController::hiddenStrip
 }
 
 bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const PHLMONITOR& monitor) {
+    if (insideRenderLifecycle() || (g_pHyprOpenGL && renderContext().m_data.pMonitor)) {
+        m_hiddenStripProxyRefresh.request();
+        scheduleHiddenStripLayerProxyRefresh();
+        return false;
+    }
     if (!layer || !monitor || !g_pHyprRenderer || !g_pHyprOpenGL || !shouldHideLayerSurface(layer, monitor))
         return false;
 
@@ -8884,6 +9277,9 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
     const int fbWidth = std::max(1, static_cast<int>(std::ceil(proxyRectGlobal.width * renderScaleForMonitor(monitor))));
     const int fbHeight = std::max(1, static_cast<int>(std::ceil(proxyRectGlobal.height * renderScaleForMonitor(monitor))));
 
+    // Snapshot rendering can emit render events; keep our overlay out of it.
+    ++m_stripSnapshotRenderDepth;
+    Hyprutils::Utils::CScopeGuard restoreDepth{[this] { --m_stripSnapshotRenderDepth; }};
     g_pHyprOpenGL->makeEGLCurrent();
     auto sourceFramebuffer = layerFramebufferFor(layer);
     if (!sourceFramebuffer || !sourceFramebuffer->isAllocated() || !sourceFramebuffer->getTexture()) {
@@ -8902,21 +9298,12 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
         return false;
     }
 
-    auto* existing = hiddenStripLayerProxyFor(layer, monitor);
-    if (!existing) {
-        HiddenStripLayerProxy proxy;
-        proxy.layer = layer;
-        proxy.monitor = monitor;
-        proxy.capturedRectGlobal = capturedRectGlobal;
-        proxy.proxyRectGlobal = proxyRectGlobal;
-        proxy.snapshotSize = Vector2D{static_cast<double>(fbWidth), static_cast<double>(fbHeight)};
-        proxy.framebuffer = createFramebuffer("hymission hidden strip layer");
-        for (auto& blurredFramebuffer : proxy.blurredFramebuffers)
-            blurredFramebuffer = createFramebuffer("hymission hidden strip layer blur");
-        m_hiddenStripLayerProxies.push_back(std::move(proxy));
-        existing = &m_hiddenStripLayerProxies.back();
-    }
-
+    // Build into fresh storage. Allocation, cropping, blitting or blur failure
+    // must not destroy the last usable proxy (including its old geometry).
+    HiddenStripLayerProxy candidate;
+    candidate.layer = layer;
+    candidate.monitor = monitor;
+    auto* existing = &candidate;
     existing->capturedRectGlobal = capturedRectGlobal;
     existing->proxyRectGlobal = proxyRectGlobal;
     existing->snapshotSize = Vector2D{static_cast<double>(fbWidth), static_cast<double>(fbHeight)};
@@ -8927,9 +9314,12 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
             blurredFramebuffer = createFramebuffer("hymission hidden strip layer blur");
     }
 
+    if (!existing->framebuffer)
+        return false;
+
     if (!existing->framebuffer->isAllocated() || std::abs(existing->framebuffer->m_size.x - fbWidth) > 0.5 || std::abs(existing->framebuffer->m_size.y - fbHeight) > 0.5) {
         existing->framebuffer->release();
-        if (!existing->framebuffer->alloc(fbWidth, fbHeight)) {
+        if (!allocateSnapshotFramebufferLike(*existing->framebuffer, *sourceFramebuffer, fbWidth, fbHeight)) {
             if (debugLogsEnabled()) {
                 std::ostringstream out;
                 out << "[hymission] strip-bar capture framebuffer alloc failed namespace=" << layer->m_namespace << " monitor=" << monitor->m_name
@@ -8942,9 +9332,11 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
     }
 
     for (auto& blurredFramebuffer : existing->blurredFramebuffers) {
+        if (!blurredFramebuffer)
+            return false;
         if (!blurredFramebuffer->isAllocated() || std::abs(blurredFramebuffer->m_size.x - fbWidth) > 0.5 || std::abs(blurredFramebuffer->m_size.y - fbHeight) > 0.5) {
             blurredFramebuffer->release();
-            if (!blurredFramebuffer->alloc(fbWidth, fbHeight)) {
+            if (!allocateSnapshotFramebufferLike(*blurredFramebuffer, *sourceFramebuffer, fbWidth, fbHeight)) {
                 if (debugLogsEnabled()) {
                     std::ostringstream out;
                     out << "[hymission] strip-bar capture blur framebuffer alloc failed namespace=" << layer->m_namespace << " monitor=" << monitor->m_name
@@ -8990,7 +9382,7 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
         const int croppedWidth = std::max(1, static_cast<int>(std::lround(capturedRectRenderLocal.width)));
         const int croppedHeight = std::max(1, static_cast<int>(std::lround(capturedRectRenderLocal.height)));
         croppedFramebuffer = createFramebuffer("hymission hidden strip layer crop");
-        if (!croppedFramebuffer || !croppedFramebuffer->alloc(croppedWidth, croppedHeight)) {
+        if (!croppedFramebuffer || !allocateSnapshotFramebufferLike(*croppedFramebuffer, *sourceFramebuffer, croppedWidth, croppedHeight)) {
             if (debugLogsEnabled()) {
                 std::ostringstream out;
                 out << "[hymission] strip-bar capture cropped framebuffer alloc failed namespace=" << layer->m_namespace << " monitor=" << monitor->m_name
@@ -9047,10 +9439,34 @@ bool OverviewController::captureHiddenStripLayerProxy(const PHLLS& layer, const 
             out << "[hymission] strip-bar capture blur build failed namespace=" << layer->m_namespace << " monitor=" << monitor->m_name;
             debugLog(out.str());
         }
-        return true;
+        return false;
     }
 
+    if (auto* previous = hiddenStripLayerProxyFor(layer, monitor))
+        *previous = std::move(candidate);
+    else
+        m_hiddenStripLayerProxies.push_back(std::move(candidate));
     return true;
+}
+
+void OverviewController::scheduleHiddenStripLayerProxyRefresh() {
+    if (!m_hiddenStripProxyRefresh.pending() || m_hiddenStripProxyRefreshTimer || !g_pEventLoopManager)
+        return;
+
+    armOrRescheduleTimer(m_hiddenStripProxyRefreshTimer, std::chrono::milliseconds(1), [this](SP<CEventLoopTimer>, void*) {
+        cancelAndClearTimer(m_hiddenStripProxyRefreshTimer);
+        if (g_controller != this || sessionLocked())
+            return;
+        // A nested event loop may fire this during rendering. Leave it pending;
+        // POST_WINDOWS will queue the next attempt. Never self-reschedule here.
+        if (insideRenderLifecycle() || (g_pHyprOpenGL && renderContext().m_data.pMonitor))
+            return;
+        if (m_hiddenStripProxyRefresh.pending()) {
+            syncHiddenStripLayerProxies();
+            if (isVisible())
+                damageOwnedMonitors();
+        }
+    });
 }
 
 void OverviewController::syncHiddenStripLayerProxies() {
@@ -9058,6 +9474,13 @@ void OverviewController::syncHiddenStripLayerProxies() {
         clearHiddenStripLayerProxies();
         return;
     }
+
+    m_hiddenStripProxyRefresh.request();
+    if (!m_hiddenStripProxyRefresh.take(insideRenderLifecycle() || (g_pHyprOpenGL && renderContext().m_data.pMonitor))) {
+        scheduleHiddenStripLayerProxyRefresh();
+        return;
+    }
+    cancelAndClearTimer(m_hiddenStripProxyRefreshTimer);
 
     std::vector<std::pair<PHLLS, PHLMONITOR>> desired;
     for (const auto& layer : Desktop::viewState()->layers()) {
@@ -9072,9 +9495,6 @@ void OverviewController::syncHiddenStripLayerProxies() {
             out << "[hymission] strip-bar sync namespace=" << layer->m_namespace << " monitor="
                 << (monitor ? monitor->m_name : std::string("<null-monitor>")) << " captured=" << (captured ? 1 : 0);
             debugLog(out.str());
-        }
-        if (!captured) {
-            std::erase_if(m_hiddenStripLayerProxies, [&](const HiddenStripLayerProxy& proxy) { return proxy.layer == layer && proxy.monitor == monitor; });
         }
     }
 
@@ -9156,7 +9576,7 @@ void OverviewController::renderHiddenStripLayerProxies() const {
     if (m_hiddenStripLayerProxies.empty() || !g_pHyprOpenGL || !hideBarAnimationEffectsEnabled())
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -9194,7 +9614,7 @@ void OverviewController::renderHiddenStripLayerProxies() const {
         }
 
         if (sharpAlpha > 0.002F)
-            g_pHyprOpenGL->renderTexture(sourceFramebuffer->getTexture(), toBox(targetRect), {.a = sharpAlpha});
+            g_pHyprOpenGL->renderTexture(renderContext(), sourceFramebuffer->getTexture(), toBox(targetRect), {.a = sharpAlpha});
 
         if (blurredAlpha <= 0.002F)
             continue;
@@ -9210,7 +9630,7 @@ void OverviewController::renderHiddenStripLayerProxies() const {
             auto* blurredFramebuffer = index < proxy.blurredFramebuffers.size() && proxy.blurredFramebuffers[index] ? proxy.blurredFramebuffers[index].get() : nullptr;
             if (!blurredFramebuffer || !blurredFramebuffer->isAllocated() || !blurredFramebuffer->getTexture() || alpha <= 0.002F)
                 return;
-            g_pHyprOpenGL->renderTexture(blurredFramebuffer->getTexture(), toBox(targetRect), {.a = alpha});
+            g_pHyprOpenGL->renderTexture(renderContext(), blurredFramebuffer->getTexture(), toBox(targetRect), {.a = alpha});
         };
 
         renderBlurLevel(lowerIndex, blurredAlpha * lowerWeight);
@@ -9330,7 +9750,7 @@ std::optional<std::size_t> OverviewController::hitTestTarget(double x, double y)
 
         for (std::size_t index = 0; index < m_state.windows.size(); ++index) {
             const auto& managed = m_state.windows[index];
-            if (managed.dragOnly || managed.isNiriFloatingOverlay != floatingOverlay)
+            if (managed.dragOnly || managed.isNiriFloatingOverlay != floatingOverlay || !pointInWindowTile(managed,x,y))
                 continue;
 
             const Rect rect = currentPreviewRect(managed);
@@ -9360,7 +9780,7 @@ std::optional<std::size_t> OverviewController::hitTestPreviewTarget(double x, do
 
         for (std::size_t index = 0; index < m_state.windows.size(); ++index) {
             const auto& managed = m_state.windows[index];
-            if (managed.dragOnly || managed.isNiriFloatingOverlay != floatingOverlay)
+            if (managed.dragOnly || managed.isNiriFloatingOverlay != floatingOverlay || !pointInWindowTile(managed,x,y))
                 continue;
 
             const Rect rect = currentPreviewRect(managed);
@@ -9498,8 +9918,19 @@ std::optional<OverviewController::DragPreviewTarget> OverviewController::dragged
     }
 
     const auto targetIndex = hitTestThumbnailDropTarget(pointer.x, pointer.y, *m_draggedWindowIndex);
-    if (!targetIndex || *targetIndex >= m_state.windows.size())
+    if (!targetIndex || *targetIndex >= m_state.windows.size()) {
+        // Empty tiles have no thumbnail hit target. Keep the overview drag
+        // owner and offer the destination desktop as a workspace drop target.
+        if (workspaceScoped() && !m_state.hoveredStripIndex)
+            if (const auto target=tileDesktopDropTarget(window,monitor,pointer)) {
+                const auto& area=target->allocation;
+                const double scale=std::min(area.w/monitor->m_size.x,area.h/monitor->m_size.y);
+                const Rect predicted=makeRect(pointer.x-actual.width*scale/2,pointer.y-actual.height*scale/2,
+                    actual.width*scale,actual.height*scale);
+                return previewForArea({area.x,area.y,area.w,area.h},predicted);
+            }
         return std::nullopt;
+    }
 
     const auto targetGroup = m_state.windows[*targetIndex].slot.rowGroup;
     if (targetGroup >= m_state.managedWorkspaces.size() || m_state.managedWorkspaces[targetGroup] == window->m_workspace)
@@ -9533,7 +9964,7 @@ std::optional<Rect> OverviewController::draggedPreviewRectFor(const PHLWINDOW& w
     if (!window || !m_draggedWindowIndex || *m_draggedWindowIndex >= m_state.windows.size())
         return std::nullopt;
 
-    if (m_groupDragSession && m_groupDragSession->group && window->m_group == m_groupDragSession->group) {
+    if (m_groupDragSession && m_groupDragSession->group && window->grouping().group() == m_groupDragSession->group) {
         std::optional<std::size_t> memberIndex;
         for (std::size_t index = 0; index < m_groupDragSession->members.size(); ++index) {
             if (m_groupDragSession->members[index].lock() == window) {
@@ -9669,6 +10100,9 @@ void OverviewController::updateDropAnimation() {
 }
 
 void OverviewController::updateGroupDragSettlement() {
+    if (sessionLocked())
+        return;
+
     if (!m_groupDragSession || !m_groupDragSession->settling || m_groupDragSession->completionScheduled)
         return;
 
@@ -9682,16 +10116,18 @@ void OverviewController::updateGroupDragSettlement() {
     m_groupDragSession->completionScheduled = true;
     const bool commitDrop = m_groupDragSession->commitDrop;
     const auto targetWorkspace = m_groupDragSession->targetWorkspace;
+    const auto targetTile=m_groupDragSession->targetTile;
     const auto frontWindow = m_groupDragSession->frontMember < m_groupDragSession->members.size() ?
         m_groupDragSession->members[m_groupDragSession->frontMember].lock() : PHLWINDOW{};
-    g_pEventLoopManager->doLater([this, commitDrop, targetWorkspace, frontWindow] {
-        if (!m_groupDragSession)
+    const auto generation = inputGeneration;
+    m_idleTasks.post([this, generation, commitDrop, targetWorkspace, targetTile, frontWindow] {
+        if (g_controller != this || sessionLocked() || generation != inputGeneration || !m_groupDragSession)
             return;
 
         const auto sourceWorkspace = frontWindow ? frontWindow->m_workspace : PHLWORKSPACE{};
         clearStripWindowDragState();
         if (commitDrop && frontWindow && targetWorkspace && sourceWorkspace != targetWorkspace) {
-            moveWindowToWorkspaceForThumbnailDrop(frontWindow, targetWorkspace);
+            moveWindowToWorkspaceForThumbnailDrop(frontWindow, targetWorkspace,targetTile);
             refreshWorkspaceLayoutSnapshot(sourceWorkspace, true);
             refreshWorkspaceLayoutSnapshot(targetWorkspace, true);
         }
@@ -9747,7 +10183,7 @@ PHLWORKSPACE OverviewController::thumbnailWorkspaceAtPoint(double x, double y) c
 }
 
 bool OverviewController::placeNewWindowInHoveredThumbnailWorkspace(const PHLWINDOW& window) {
-    if (!window || m_applyingThumbnailNewWindowPlacement || m_state.engine != LayoutEngine::Thumbnail || m_workspaceTransition.active || window->m_pinned ||
+    if (!window || m_applyingThumbnailNewWindowPlacement || m_state.engine != LayoutEngine::Thumbnail || m_workspaceTransition.active || static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) ||
         !window->m_workspace)
         return false;
 
@@ -9756,7 +10192,7 @@ bool OverviewController::placeNewWindowInHoveredThumbnailWorkspace(const PHLWIND
 
     const Vector2D pointer = g_pInputManager->getMouseCoordsInternal();
     const auto     targetWorkspace = thumbnailWorkspaceAtPoint(pointer.x, pointer.y);
-    if (!targetWorkspace || targetWorkspace == window->m_workspace || targetWorkspace->m_isSpecialWorkspace)
+    if (!targetWorkspace || targetWorkspace == window->m_workspace || (targetWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
     const auto sourceWorkspace = window->m_workspace;
@@ -9791,6 +10227,13 @@ std::optional<Rect> OverviewController::workspaceTransitionRectForWindow(const P
     const auto* targetManaged = managedWindowFor(m_workspaceTransition.targetState, window, true);
     if (!sourceManaged && !targetManaged)
         return std::nullopt;
+    if (m_workspaceTransition.tileId) {
+        const auto* managed=sourceManaged?sourceManaged:targetManaged;
+        auto* tiles=TilesController::get();
+        if (managed->targetMonitor!=m_workspaceTransition.monitor || !tiles ||
+            tiles->preferredTile(window->m_workspace,managed->targetMonitor)!=m_workspaceTransition.tileId)
+            return managed->targetGlobal;
+    }
 
     const double clampedDelta = std::clamp(m_workspaceTransition.delta, -m_workspaceTransition.distance, m_workspaceTransition.distance);
     const double sourceOffset = -clampedDelta;
@@ -9893,7 +10336,7 @@ Rect OverviewController::closeButtonRectFor(const ManagedWindow& window) const {
     Rect tile;
 
     if (m_state.engine == LayoutEngine::Thumbnail) {
-        const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        const auto renderMonitor = renderContext().m_data.pMonitor.lock();
         if (!renderMonitor)
             return {};
         tile = thumbnailGroupRect(renderMonitor, window.slot.rowGroup);
@@ -9920,6 +10363,7 @@ std::optional<std::size_t> OverviewController::hitTestCloseButton(double x, doub
                 continue;
             checkedGroups.insert(group);
         }
+        if (!pointInWindowTile(m_state.windows[index],x,y)) continue;
         const Rect rect = closeButtonRectFor(m_state.windows[index]);
         if (rect.width <= 0.0 || rect.height <= 0.0)
             continue;
@@ -9978,15 +10422,32 @@ std::optional<stage::EdgeFrame> OverviewController::stageTransitionFrame(const P
     const Rect output{monitor->m_position.x, monitor->m_position.y, monitor->m_size.x, monitor->m_size.y};
     const auto transform = windowTransformFor(window, monitor);
     const Rect current = transform ? transform->targetGlobal : currentPreviewRect(*managed);
+    const auto constrain = [&](stage::EdgeFrame frame) {
+        auto* tiles=TilesController::get();
+        if (!frame.viewport.revealDecorations || !workspaceScoped() || !tiles || !tiles->enabled(monitor)) return frame;
+        const auto id=tiles->preferredTile(window->m_workspace,monitor);
+        for (const auto& view:tiles->views(monitor)) if (view.id==id) {
+            const auto desktop=StageController::tilePresentation(monitor,view.allocation).value_or(view.allocation);
+            const Rect owner=lerpRect({desktop.x,desktop.y,desktop.w,desktop.h},
+                                     {view.allocation.x,view.allocation.y,view.allocation.w,view.allocation.h},progress);
+            auto& v=frame.viewport.box;
+            const double right=std::min(v.x+v.width,owner.x+owner.width);
+            v.x=std::max(v.x,owner.x); v.width=std::max(0.0,right-v.x);
+            const auto clipped=toBox(frame.clip).intersection(toBox(owner));
+            frame.clip={clipped.x,clipped.y,clipped.w,clipped.h};
+            break;
+        }
+        return frame;
+    };
     if (managed->stageTransitionStart && opening == managed->stageTransitionOpening) {
         const double t = m_state.phase == Phase::ClosingSettle ? 0 :
             stage::overviewTransitionProgress(managed->stageTransitionStartProgress, progress, opening);
         const auto from = stage::overviewRevealFrame(*managed->stageTransitionStart, current, output, 0);
         const auto to = !opening && endpoint ? stage::overviewRevealFrame(*endpoint, current, output, 0) :
             stage::EdgeFrame{stage::edgeViewport(output, 0, 0), output};
-        return stage::interpolateEdgeFrame(from, to, t);
+        return constrain(stage::interpolateEdgeFrame(from, to, t));
     }
-    return endpoint ? std::optional{stage::overviewRevealFrame(*endpoint, current, output, progress)} : std::nullopt;
+    return endpoint ? std::optional{constrain(stage::overviewRevealFrame(*endpoint, current, output, progress))} : std::nullopt;
 }
 
 double OverviewController::visualProgress() const {
@@ -10024,6 +10485,8 @@ Vector2D OverviewController::workspaceStripEnterOffset(const PHLMONITOR& monitor
     const Rect band = workspaceStripBandRectForMonitor(monitor, m_state);
     const double hiddenFraction = 1.0 - progress;
 
+    if (auto* tiles=TilesController::get();tiles && tiles->enabled(monitor))
+        return Vector2D{-band.width*hiddenFraction,0.0};
     switch (parseWorkspaceStripAnchor(workspaceStripAnchor())) {
         case WorkspaceStripAnchor::Left:
             return Vector2D{-band.width * hiddenFraction, 0.0};
@@ -10070,7 +10533,7 @@ Vector2D OverviewController::workspaceStripScrollOffset(const PHLMONITOR& monito
     return Vector2D{shift.x * fraction, shift.y * fraction};
 }
 
-Vector2D OverviewController::workspaceStripCenteringShift(const PHLMONITOR& monitor, WORKSPACEID workspaceId) const {
+Vector2D OverviewController::workspaceStripCenteringShift(const PHLMONITOR& monitor, WorkspaceKey workspaceId) const {
     if (!monitor || !niriModeEnabled() || !workspaceStripCenterActiveEnabled())
         return {};
 
@@ -10193,7 +10656,7 @@ bool OverviewController::updateNativeRelayoutAnimation() {
 
 PHLWINDOW OverviewController::resolveGestureCloseFocus() const {
     return resolveGestureExitFocus(m_state.focusBeforeOpen, preferredOverviewExitFocus(), gestureCloseRestoresFocus(),
-                                   m_state.focusBeforeOpen && m_state.focusBeforeOpen->m_isMapped);
+                                   m_state.focusBeforeOpen && m_state.focusBeforeOpen->mapped());
 }
 
 PHLWINDOW OverviewController::resolveExitFocus(CloseMode mode) const {
@@ -10204,10 +10667,10 @@ PHLWINDOW OverviewController::resolveExitFocus(CloseMode mode) const {
 }
 
 bool OverviewController::exitFocusChangedWorkspace(const PHLWINDOW& window) const {
-    if (!window || !window->m_workspace || window->m_workspace->m_isSpecialWorkspace)
+    if (!window || !window->m_workspace || (window->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
-    if (!m_state.focusBeforeOpen || !m_state.focusBeforeOpen->m_workspace || m_state.focusBeforeOpen->m_workspace->m_isSpecialWorkspace)
+    if (!m_state.focusBeforeOpen || !m_state.focusBeforeOpen->m_workspace || (m_state.focusBeforeOpen->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return false;
 
     return window->m_workspace != m_state.focusBeforeOpen->m_workspace;
@@ -10218,7 +10681,7 @@ bool OverviewController::shouldPreferGoalExitGeometry(const PHLWINDOW& window) c
 }
 
 std::optional<Vector2D> OverviewController::visiblePointForWindowOnMonitor(const PHLWINDOW& window, const PHLMONITOR& monitor, bool preferGoal) const {
-    if (!window || !monitor || !window->m_isMapped)
+    if (!window || !monitor || !window->mapped())
         return std::nullopt;
 
     if (preferGoal) {
@@ -10231,7 +10694,7 @@ std::optional<Vector2D> OverviewController::visiblePointForWindowOnMonitor(const
 }
 
 bool OverviewController::shouldClearWorkspaceFullscreenForExitTarget(const PHLWINDOW& window) const {
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return false;
 
     const auto* backup = fullscreenBackupForWorkspace(window->m_workspace);
@@ -10243,7 +10706,7 @@ bool OverviewController::shouldClearWorkspaceFullscreenForExitTarget(const PHLWI
 
     PHLWINDOW fullscreenWindow;
     for (const auto& candidate : Desktop::viewState()->windows()) {
-        if (!candidate || !candidate->m_isMapped || candidate->m_workspace != backup->workspace)
+        if (!candidate || !candidate->mapped() || candidate->m_workspace != backup->workspace)
             continue;
 
         if (Fullscreen::controller()->getFullscreenModes(candidate).internal != FSMODE_NONE) {
@@ -10266,7 +10729,7 @@ bool OverviewController::clearWorkspaceFullscreenForExitTarget(const PHLWINDOW& 
 
     PHLWINDOW fullscreenWindow;
     for (const auto& candidate : Desktop::viewState()->windows()) {
-        if (!candidate || !candidate->m_isMapped || candidate->m_workspace != backupIt->workspace)
+        if (!candidate || !candidate->mapped() || candidate->m_workspace != backupIt->workspace)
             continue;
 
         if (Fullscreen::controller()->getFullscreenModes(candidate).internal != FSMODE_NONE) {
@@ -10298,7 +10761,7 @@ bool OverviewController::clearWorkspaceFullscreenForExitTarget(const PHLWINDOW& 
 }
 
 bool OverviewController::activateWindowWorkspaceForFocus(const PHLWINDOW& window) const {
-    if (!window || !window->m_isMapped || window->m_pinned || !window->m_workspace)
+    if (!window || !window->mapped() || static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) || !window->m_workspace)
         return false;
 
     const auto workspace = window->m_workspace;
@@ -10308,11 +10771,11 @@ bool OverviewController::activateWindowWorkspaceForFocus(const PHLWINDOW& window
     if (!monitor)
         return false;
 
-    if (workspace->m_isSpecialWorkspace) {
+    if ((workspace->type() == Workspace::eWorkspaceType::SPECIAL)) {
         if (monitor->m_activeSpecialWorkspace == workspace)
             return false;
 
-        workspace->m_lastFocusedWindow = window;
+        workspace->rememberFocusedWindow(window);
         monitor->changeWorkspace(workspace, true, true, true);
         return true;
     }
@@ -10320,13 +10783,16 @@ bool OverviewController::activateWindowWorkspaceForFocus(const PHLWINDOW& window
     if (monitor->m_activeWorkspace == workspace)
         return false;
 
-    workspace->m_lastFocusedWindow = window;
+    workspace->rememberFocusedWindow(window);
     monitor->changeWorkspace(workspace, true, true, true);
     return true;
 }
 
 void OverviewController::commitOverviewExitFocus(const PHLWINDOW& window) {
-    if (!window || !window->m_isMapped)
+    if (sessionLocked())
+        return;
+
+    if (!window || !window->mapped())
         return;
 
     const bool alreadyFocused = Desktop::focusState()->window() == window;
@@ -10357,7 +10823,7 @@ void OverviewController::commitOverviewExitFocus(const PHLWINDOW& window) {
         return;
     }
 
-    if (window->m_isFloating)
+    if (window->isFloating())
         Desktop::windowState()->raise(window);
 
     recordWindowActivation(window, true);
@@ -10387,7 +10853,7 @@ void OverviewController::commitOverviewExitFocus(const PHLWINDOW& window) {
 }
 
 bool OverviewController::syncScrollingWorkspaceSpotOnWindow(const PHLWINDOW& window) const {
-    if (!window || !window->m_isMapped || !window->m_workspace || !isScrollingWorkspace(window->m_workspace))
+    if (!window || !window->mapped() || !window->m_workspace || !isScrollingWorkspace(window->m_workspace))
         return false;
 
     const auto target = window->layoutTarget();
@@ -10450,7 +10916,7 @@ bool OverviewController::syncScrollingWorkspaceSpotOnWindow(const PHLWINDOW& win
 }
 
 void OverviewController::refreshExitLayoutForFocus(const PHLWINDOW& window) const {
-    if (!window || !window->m_isMapped)
+    if (!window || !window->mapped())
         return;
 
     std::vector<PHLMONITOR> monitors;
@@ -10487,7 +10953,7 @@ void OverviewController::refreshExitLayoutForFocus(const PHLWINDOW& window) cons
 }
 
 void OverviewController::syncRealFocusDuringOverview(const PHLWINDOW& window, bool syncScrollingSpot) {
-    if (!shouldSyncRealFocusDuringOverview() || !window || !window->m_isMapped || !hasManagedWindow(window))
+    if (!shouldSyncRealFocusDuringOverview() || !window || !window->mapped() || !hasManagedWindow(window))
         return;
 
     if (Desktop::focusState()->window() == window) {
@@ -10579,7 +11045,7 @@ void OverviewController::syncFocusDuringOverviewFromSelection(bool syncScrolling
 }
 
 void OverviewController::queueSelectionRetargetDuringOverview(const PHLWINDOW& window, bool syncScrollingSpot, const char* source) {
-    if (!window || !window->m_isMapped || !hasManagedWindow(window))
+    if (!window || !window->mapped() || !hasManagedWindow(window))
         return;
 
     m_queuedOverviewSelectionTarget = window;
@@ -10595,6 +11061,9 @@ void OverviewController::queueSelectionRetargetDuringOverview(const PHLWINDOW& w
 }
 
 void OverviewController::flushQueuedSelectionRetargetDuringOverview() {
+    if (sessionLocked())
+        return;
+
     const auto queuedTarget = m_queuedOverviewSelectionTarget.lock();
     if (!queuedTarget)
         return;
@@ -10606,7 +11075,7 @@ void OverviewController::flushQueuedSelectionRetargetDuringOverview() {
     const bool syncScrollingSpot = m_queuedOverviewSelectionSyncScrollingSpot;
     m_queuedOverviewSelectionSyncScrollingSpot = false;
 
-    if (!queuedTarget->m_isMapped || !hasManagedWindow(queuedTarget))
+    if (!queuedTarget->mapped() || !hasManagedWindow(queuedTarget))
         return;
 
     const auto queuedIt =
@@ -10631,7 +11100,7 @@ void OverviewController::flushQueuedSelectionRetargetDuringOverview() {
 }
 
 void OverviewController::queueRealFocusDuringOverview(const PHLWINDOW& window, bool syncScrollingSpot, const char* source) {
-    if (!window || !window->m_isMapped || !hasManagedWindow(window))
+    if (!window || !window->mapped() || !hasManagedWindow(window))
         return;
 
     m_queuedOverviewLiveFocusTarget = window;
@@ -10647,6 +11116,9 @@ void OverviewController::queueRealFocusDuringOverview(const PHLWINDOW& window, b
 }
 
 void OverviewController::flushQueuedRealFocusDuringOverview() {
+    if (sessionLocked())
+        return;
+
     const auto queuedTarget = m_queuedOverviewLiveFocusTarget.lock();
     if (!queuedTarget)
         return;
@@ -10658,7 +11130,7 @@ void OverviewController::flushQueuedRealFocusDuringOverview() {
     m_queuedOverviewLiveFocusTarget.reset();
     m_queuedOverviewLiveFocusSyncScrollingSpot = false;
 
-    if (!queuedTarget->m_isMapped || !hasManagedWindow(queuedTarget))
+    if (!queuedTarget->mapped() || !hasManagedWindow(queuedTarget))
         return;
 
     if (debugLogsEnabled()) {
@@ -10758,7 +11230,10 @@ void OverviewController::updateSelectedWindowLayout(const PHLWINDOW& previousSel
         return;
     }
 
-    const Rect boundsLocal = overviewContentRectForMonitor(currentManaged->targetMonitor, m_state);
+    auto boundsLocal = overviewContentRectForMonitor(currentManaged->targetMonitor, m_state);
+    auto* tiles=TilesController::get();
+    const auto expansionTile=workspaceScoped() && tiles && tiles->enabled(currentManaged->targetMonitor)?tiles->preferredTile(currentManaged->window->m_workspace,currentManaged->targetMonitor):0;
+    if (expansionTile) boundsLocal=tileContentRect(currentManaged->targetMonitor,expansionTile,m_state);
     const Rect boundsGlobal =
         makeRect(currentManaged->targetMonitor->m_position.x + boundsLocal.x, currentManaged->targetMonitor->m_position.y + boundsLocal.y, boundsLocal.width, boundsLocal.height);
     if (boundsGlobal.width <= 1.0 || boundsGlobal.height <= 1.0) {
@@ -10766,228 +11241,20 @@ void OverviewController::updateSelectedWindowLayout(const PHLWINDOW& previousSel
         return;
     }
 
-    struct RipplePeer {
-        std::size_t index = 0;
-        Rect        base;
-        double      distance = 0.0;
-    };
-
-    const Rect selectedBase = baseTargets[currentManagedIndex];
-    const LayoutConfig layoutConfig = loadLayoutConfig();
-    const double minGapX = std::max(0.0, layoutConfig.columnSpacing * 0.25);
-    const double minGapY = std::max(0.0, layoutConfig.rowSpacing * 0.25);
-    const double maxGrowthXPerSide = std::max(0.0, layoutConfig.columnSpacing * 2.0);
-    const double maxGrowthYPerSide = std::max(0.0, layoutConfig.rowSpacing * 2.0);
-    const double scaleCapByGrowth = maxCenteredScaleForPerSideGrowth(selectedBase, maxGrowthXPerSide, maxGrowthYPerSide);
-    const double scaleCapByBounds = maxCenteredScaleForBounds(selectedBase, boundsGlobal);
-    const double preferredScale = m_state.windows.size() <= 1 ? 1.0 : expansionScale.value_or(selectedExpandScale());
-    const double scaleCap = std::max(1.0, std::min({preferredScale, scaleCapByGrowth, scaleCapByBounds}));
-    const double rippleRadius =
-        std::max(std::hypot(selectedBase.width, selectedBase.height) * 2.5, std::hypot(boundsGlobal.width, boundsGlobal.height) * 0.55);
-    const double pressureCenterX = selectedBase.centerX();
-    const double pressureCenterY = selectedBase.centerY();
-
-    std::vector<RipplePeer> peers;
-    peers.reserve(m_state.windows.size());
+    std::vector<std::size_t> peers;
+    std::vector<Rect> orderTargets;
+    orderTargets.reserve(m_state.windows.size());
     for (std::size_t index = 0; index < m_state.windows.size(); ++index) {
         const auto& managed = m_state.windows[index];
-        if (index == currentManagedIndex || managed.targetMonitor != currentManaged->targetMonitor)
-            continue;
-
-        const Rect base = baseTargets[index];
-        const double distance = std::hypot(base.centerX() - pressureCenterX, base.centerY() - pressureCenterY);
-        peers.push_back({.index = index, .base = base, .distance = distance});
+        orderTargets.push_back(managed.targetMonitor ? overviewContentTargetForSlot(managed.window, managed.targetMonitor, managed.slot) : baseTargets[index]);
+        if (index != currentManagedIndex && managed.targetMonitor == currentManaged->targetMonitor &&
+            (!expansionTile || tiles->preferredTile(managed.window->m_workspace, managed.targetMonitor) == expansionTile))
+            peers.push_back(index);
     }
-
-    std::stable_sort(peers.begin(), peers.end(), [](const RipplePeer& lhs, const RipplePeer& rhs) { return lhs.distance < rhs.distance; });
-
-    const auto applyTargets = [&](const std::vector<Rect>& targets) {
-        for (std::size_t index = 0; index < m_state.windows.size() && index < targets.size(); ++index)
-            m_state.windows[index].targetGlobal = targets[index];
-    };
-
-    const auto tryApplyScale = [&](double scale, std::vector<Rect>& outTargets, double& outMaxShift) -> bool {
-        outTargets = baseTargets;
-        outMaxShift = 0.0;
-
-        const Rect selectedTarget = scaleRectAroundCenter(selectedBase, scale);
-        if (!rectFitsInsideBounds(selectedTarget, boundsGlobal))
-            return false;
-        outTargets[currentManagedIndex] = selectedTarget;
-
-        const double pressureGap = std::max({1.0, minGapX, minGapY});
-        const double radialPressure =
-            std::max(pressureGap, std::hypot(selectedTarget.width - selectedBase.width, selectedTarget.height - selectedBase.height) * 0.5 + pressureGap);
-
-        std::vector<std::size_t> placed;
-        placed.reserve(peers.size() + 1);
-        placed.push_back(currentManagedIndex);
-
-        const auto overlapsPlaced = [&](const Rect& target) {
-            return std::ranges::any_of(placed, [&](std::size_t obstacleIndex) {
-                return rectsOverlap(target, inflateRect(outTargets[obstacleIndex], minGapX, minGapY));
-            });
-        };
-
-        const auto resolveAlongBearing = [&](Rect target, double dirX, double dirY) -> std::optional<Rect> {
-            for (std::size_t pass = 0; pass < 6; ++pass) {
-                bool changed = false;
-                for (const auto obstacleIndex : placed) {
-                    const Rect obstacle = inflateRect(outTargets[obstacleIndex], minGapX, minGapY);
-                    if (!rectsOverlap(target, obstacle))
-                        continue;
-
-                    if (std::abs(dirX) < 0.001 && std::abs(dirY) < 0.001) {
-                        dirX = target.centerX() >= pressureCenterX ? 1.0 : -1.0;
-                        dirY = target.centerY() >= pressureCenterY ? 1.0 : -1.0;
-                        const double length = std::hypot(dirX, dirY);
-                        if (length <= 0.001)
-                            return std::nullopt;
-                        dirX /= length;
-                        dirY /= length;
-                    }
-
-                    const auto exitDistance = overlapExitDistanceAlongDirection(target, obstacle, dirX, dirY);
-                    if (!exitDistance)
-                        continue;
-
-                    target = translateRect(target, dirX * *exitDistance, dirY * *exitDistance);
-                    target = clampRectInside(target, boundsGlobal);
-                    changed = true;
-                }
-
-                if (!changed)
-                    break;
-            }
-
-            if (!rectFitsInsideBounds(target, boundsGlobal) || overlapsPlaced(target))
-                return std::nullopt;
-
-            return target;
-        };
-
-        const auto motionDirectionsForPeer = [&](const Rect& base, double radialX, double radialY) {
-            std::vector<std::pair<double, double>> directions;
-            directions.reserve(10);
-
-            const auto appendDirection = [&](double dx, double dy) {
-                const double length = std::hypot(dx, dy);
-                if (length <= 0.001)
-                    return;
-                dx /= length;
-                dy /= length;
-                const auto duplicate = std::ranges::any_of(directions, [&](const auto& existing) {
-                    return std::abs(existing.first - dx) <= 0.001 && std::abs(existing.second - dy) <= 0.001;
-                });
-                if (!duplicate)
-                    directions.push_back({dx, dy});
-            };
-
-            const EdgeMotionAffinity affinity = edgeMotionAffinityForRect(base, boundsGlobal);
-            const double             awayX = std::abs(radialX) > 0.001 ? radialX : (base.centerX() >= pressureCenterX ? 1.0 : -1.0);
-            const double             awayY = std::abs(radialY) > 0.001 ? radialY : (base.centerY() >= pressureCenterY ? 1.0 : -1.0);
-
-            if (affinity.verticalEdge > 0.15) {
-                appendDirection(0.0, awayY);
-                appendDirection(0.0, 1.0);
-                appendDirection(0.0, -1.0);
-            }
-            if (affinity.horizontalEdge > 0.15) {
-                appendDirection(awayX, 0.0);
-                appendDirection(1.0, 0.0);
-                appendDirection(-1.0, 0.0);
-            }
-
-            appendDirection(radialX, radialY);
-            appendDirection(radialX, 0.0);
-            appendDirection(0.0, radialY);
-            appendDirection(1.0, 0.0);
-            appendDirection(-1.0, 0.0);
-            appendDirection(0.0, 1.0);
-            appendDirection(0.0, -1.0);
-            return directions;
-        };
-
-        for (const auto& peer : peers) {
-            const double deltaX = peer.base.centerX() - pressureCenterX;
-            const double deltaY = peer.base.centerY() - pressureCenterY;
-            double directionX = deltaX;
-            double directionY = deltaY;
-            const double directionLength = std::hypot(directionX, directionY);
-            if (directionLength > 0.001) {
-                directionX /= directionLength;
-                directionY /= directionLength;
-            } else {
-                directionX = peer.base.centerX() >= pressureCenterX ? 1.0 : -1.0;
-                directionY = peer.base.centerY() >= pressureCenterY ? 1.0 : -1.0;
-                const double fallbackLength = std::hypot(directionX, directionY);
-                if (fallbackLength <= 0.001)
-                    return false;
-                directionX /= fallbackLength;
-                directionY /= fallbackLength;
-            }
-
-            const double influence = clampUnit(1.0 - peer.distance / std::max(1.0, rippleRadius));
-            const double easedInfluence = influence * influence;
-            Rect target = translateRect(peer.base, directionX * radialPressure * easedInfluence, directionY * radialPressure * easedInfluence);
-            target = clampRectInside(target, boundsGlobal);
-
-            std::optional<Rect> resolved;
-            double              resolvedScore = std::numeric_limits<double>::max();
-            for (const auto& [candidateDirX, candidateDirY] : motionDirectionsForPeer(peer.base, directionX, directionY)) {
-                auto candidate = resolveAlongBearing(target, candidateDirX, candidateDirY);
-                if (!candidate)
-                    candidate = resolveAlongBearing(clampRectInside(peer.base, boundsGlobal), candidateDirX, candidateDirY);
-                if (!candidate)
-                    continue;
-
-                const double score = edgeAwareMotionDistance2(peer.base, *candidate, boundsGlobal);
-                if (!resolved || score < resolvedScore) {
-                    resolved = candidate;
-                    resolvedScore = score;
-                }
-            }
-            if (!resolved)
-                return false;
-
-            outTargets[peer.index] = *resolved;
-            placed.push_back(peer.index);
-            outMaxShift = std::max(outMaxShift, std::hypot(resolved->centerX() - peer.base.centerX(), resolved->centerY() - peer.base.centerY()));
-        }
-
-        return true;
-    };
-
-    std::vector<Rect> bestTargets = baseTargets;
-    std::vector<Rect> candidateTargets;
-    double            bestMaxShift = 0.0;
-    double            maxShift = 0.0;
-    double            appliedScale = 1.0;
-
-    if (tryApplyScale(scaleCap, bestTargets, bestMaxShift)) {
-        appliedScale = scaleCap;
-        maxShift = bestMaxShift;
-    } else {
-        const bool baseResolved = tryApplyScale(1.0, bestTargets, bestMaxShift);
-        maxShift = baseResolved ? bestMaxShift : 0.0;
-
-        double low = 1.0;
-        double high = scaleCap;
-        for (std::size_t iteration = 0; iteration < 12 && high - low > 0.001; ++iteration) {
-            const double mid = (low + high) * 0.5;
-            double       candidateMaxShift = 0.0;
-            if (tryApplyScale(mid, candidateTargets, candidateMaxShift)) {
-                appliedScale = mid;
-                maxShift = candidateMaxShift;
-                bestTargets = candidateTargets;
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-    }
-
-    applyTargets(bestTargets);
+    const auto result = expansion::compute(baseTargets, orderTargets, currentManagedIndex, peers, boundsGlobal, loadLayoutConfig(),
+                                           m_state.windows.size() <= 1 ? 1.0 : expansionScale.value_or(selectedExpandScale()));
+    for (std::size_t index = 0; index < m_state.windows.size(); ++index)
+        m_state.windows[index].targetGlobal = result.targets[index];
 
     for (auto& managed : m_state.windows) {
         if (!rectApproxEqual(managed.relayoutFromGlobal, managed.targetGlobal, 0.5))
@@ -10998,13 +11265,13 @@ void OverviewController::updateSelectedWindowLayout(const PHLWINDOW& previousSel
         std::ostringstream out;
         out << "[hymission] expand-target ripple push target=" << debugWindowLabel(currentSelectedWindow)
             << " peers=" << peers.size()
-            << " radius=" << rippleRadius
-            << " scale=" << appliedScale
-            << " scaleCap=" << scaleCap
-            << " growthCap=" << scaleCapByGrowth
-            << " boundsCap=" << scaleCapByBounds
-            << " minGap=" << minGapX << 'x' << minGapY
-            << " maxShift=" << maxShift
+            << " radius=" << result.rippleRadius
+            << " scale=" << result.appliedScale
+            << " scaleCap=" << result.scaleCap
+            << " growthCap=" << result.scaleCapByGrowth
+            << " boundsCap=" << result.scaleCapByBounds
+            << " minGap=" << result.minGapX << 'x' << result.minGapY
+            << " maxShift=" << result.maxShift
             << " selectedTarget=" << rectToString(m_state.windows[currentManagedIndex].targetGlobal);
         debugLog(out.str());
     }
@@ -11036,8 +11303,8 @@ void OverviewController::scheduleVisibleStateRebuild() {
 
     m_visibleStateRebuildScheduled = true;
     const auto generation = ++m_visibleStateRebuildGeneration;
-    g_pEventLoopManager->doLater([this, generation] {
-        if (g_controller != this || generation != m_visibleStateRebuildGeneration)
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != m_visibleStateRebuildGeneration)
             return;
 
         m_visibleStateRebuildScheduled = false;
@@ -11081,8 +11348,8 @@ void OverviewController::scheduleWorkspaceChangeHandling(const PHLWORKSPACE& wor
 
     m_workspaceChangeHandlingScheduled = true;
     const auto generation = ++m_workspaceChangeHandlingGeneration;
-    g_pEventLoopManager->doLater([this, generation] {
-        if (g_controller != this || generation != m_workspaceChangeHandlingGeneration)
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != m_workspaceChangeHandlingGeneration)
             return;
 
         m_workspaceChangeHandlingScheduled = false;
@@ -11132,8 +11399,8 @@ void OverviewController::schedulePendingWindowGeometryRetry(const PHLWINDOW& win
 
     m_pendingWindowGeometryRetryScheduled = true;
     const auto generation = ++m_pendingWindowGeometryRetryGeneration;
-    g_pEventLoopManager->doLater([this, generation] {
-        if (g_controller != this || generation != m_pendingWindowGeometryRetryGeneration)
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != m_pendingWindowGeometryRetryGeneration)
             return;
 
         m_pendingWindowGeometryRetryScheduled = false;
@@ -11234,6 +11501,7 @@ void OverviewController::clearPostCloseForcedFocus() {
 }
 
 void OverviewController::clearPostCloseDispatcher() {
+    m_postCloseNativeAction = nullptr;
     m_postCloseDispatcher = PostCloseDispatcher::None;
     m_postCloseDispatcherArgs.clear();
 }
@@ -11241,6 +11509,19 @@ void OverviewController::clearPostCloseDispatcher() {
 void OverviewController::queuePostCloseDispatcher(PostCloseDispatcher dispatcher, std::string args) {
     m_postCloseDispatcher = dispatcher;
     m_postCloseDispatcherArgs = std::move(args);
+}
+
+std::optional<Config::Actions::ActionResult> OverviewController::queueNativeFullscreenAction(std::function<Config::Actions::ActionResult()> action) {
+    if (sessionLocked() || !isVisible())
+        return std::nullopt;
+    if (m_state.phase == Phase::Closing || m_state.phase == Phase::ClosingSettle)
+        return Config::Actions::ActionResult{};
+    if (!selectedWindow())
+        return Config::Actions::actionError("no selected window in overview");
+    clearPostCloseDispatcher();
+    m_postCloseNativeAction = std::move(action);
+    beginClose(CloseMode::ActivateSelection);
+    return Config::Actions::ActionResult{};
 }
 
 SDispatchResult OverviewController::runHookedDispatcher(PostCloseDispatcher dispatcher, std::string args) {
@@ -11262,7 +11543,7 @@ SDispatchResult OverviewController::runHookedDispatcher(PostCloseDispatcher disp
     if (!original)
         return {.success = false, .error = "fullscreen dispatcher hook unavailable"};
 
-    if (!isVisible())
+    if (sessionLocked() || !isVisible())
         return original(std::move(args));
 
     if (m_state.phase == Phase::Closing || m_state.phase == Phase::ClosingSettle)
@@ -11297,7 +11578,7 @@ void OverviewController::setFullscreenRenderOverride(bool suppress) {
             if (!window)
                 return;
 
-            auto& alpha = window->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+            auto& alpha = window->presentation().alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
             const auto existing = std::find_if(m_fullscreenAlphaBackups.begin(), m_fullscreenAlphaBackups.end(),
                                                [&](const FullscreenAlphaBackup& backup) { return backup.window == window; });
             const bool alreadyBackedUp = existing != m_fullscreenAlphaBackups.end();
@@ -11331,7 +11612,7 @@ void OverviewController::setFullscreenRenderOverride(bool suppress) {
         if (!backup.window)
             continue;
 
-        auto& alpha = backup.window->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+        auto& alpha = backup.window->presentation().alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
         alpha->setValueAndWarp(backup.value);
         if (std::abs(backup.goal - backup.value) > 0.0001F)
             *alpha = backup.goal;
@@ -11384,6 +11665,11 @@ CRegion OverviewController::transformRegionForWindow(const PHLWINDOW& window, co
 
 void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requestedScope, PHLWINDOW preferredSelectedWindow,
                                    const std::vector<WorkspaceOverride>& workspaceOverrides) {
+    if (sessionLocked())
+        return;
+
+    StageController::cancelTileTransfer();
+
     setAnimationsEnabledOverride(false);
     clearToggleSwitchSession();
 
@@ -11395,9 +11681,9 @@ void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requ
     m_workspaceSwipeGesture = {};
     recordWindowActivation(Desktop::focusState()->window());
     const auto layoutSelectedWindow =
-        preferredSelectedWindow && preferredSelectedWindow->m_isMapped ? preferredSelectedWindow :
+        preferredSelectedWindow && preferredSelectedWindow->mapped() ? preferredSelectedWindow :
         (expandSelectedWindowEnabled() ? Desktop::focusState()->window() : PHLWINDOW{});
-    State next = buildState(monitor, requestedScope, workspaceOverrides, false, false, layoutSelectedWindow);
+    State next = buildState(monitor, requestedScope, workspaceOverrides, false, false, layoutSelectedWindow, wasVisible ? &m_state : nullptr);
     // An empty overview is a normal no-op, including when opened by a gesture.
     if (next.windows.empty() && next.stripEntries.empty())
         return;
@@ -11407,7 +11693,7 @@ void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requ
             const auto origin = StageController::overviewOrigin(window.window);
             if (!origin)
                 continue;
-            if (stage::overviewEndpointVisible(*origin)) {
+            if (stage::overviewEndpointVisible(*origin) || origin->viewport.revealDecorations) {
                 window.stageOpeningGlobal = origin->window;
                 window.stageOpeningEndpoint = origin;
             } else
@@ -11480,6 +11766,7 @@ void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requ
     m_deactivatePending = false;
     carryOverWorkspaceStripSnapshots(next, m_state);
     m_state = std::move(next);
+    sendSearchResultCount();
     warnAboutVimLabels();
     if (!pickLabelsEnabled() && !vimKeysEnabled())
         (void)startSearchInput();
@@ -11492,13 +11779,13 @@ void OverviewController::beginOpen(const PHLMONITOR& monitor, ScopeOverride requ
     if (m_state.selectedIndex && *m_state.selectedIndex < m_state.windows.size())
         latchHoverSelectionAnchor(g_pInputManager->getMouseCoordsInternal());
     applyWorkspaceNameOverrides(m_state);
-    clearHiddenStripLayerProxies();
     syncHiddenStripLayerProxies();
     setInputFollowMouseOverride(true);
     setScrollingFollowFocusOverride(true);
     setFullscreenRenderOverride(true);
     refreshWorkspaceStripSnapshots();
-    g_pHyprRenderer->m_directScanoutBlocked = true;
+    for (const auto& output : ownedMonitors())
+        output->m_solitaryClient.reset();
     m_postOpenRefreshFrames = 3;
     if (!m_suppressInitialHoverUpdate)
         updateHoveredFromPointer(false, false, false, false, "opening-complete");
@@ -11538,16 +11825,16 @@ bool OverviewController::retargetGestureScope(ScopeOverride requestedScope) {
     std::vector<WorkspaceOverride> workspaceOverrides;
 
     const auto targetPolicy = loadCollectionPolicy(requestedScope);
-    if (targetPolicy.onlyActiveWorkspace && preferredWindow && preferredWindow->m_isMapped && preferredWindow->m_workspace &&
-        !preferredWindow->m_workspace->m_isSpecialWorkspace) {
+    if (targetPolicy.onlyActiveWorkspace && preferredWindow && preferredWindow->mapped() && preferredWindow->m_workspace &&
+        !(preferredWindow->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL)) {
         const auto workspace = preferredWindow->m_workspace;
         if (const auto workspaceMonitor = workspace->m_monitor.lock()) {
             monitor = workspaceMonitor;
             workspaceOverrides.push_back({
                 .monitorId = workspaceMonitor->m_id,
                 .workspace = workspace,
-                .workspaceId = workspace->m_id,
-                .workspaceName = workspace->m_name,
+                .workspaceId = workspaceKey(workspace),
+                .workspaceName = workspace->displayName(),
                 .syntheticEmpty = false,
             });
         }
@@ -11594,6 +11881,12 @@ bool OverviewController::retargetGestureScope(ScopeOverride requestedScope) {
 }
 
 void OverviewController::beginClose(CloseMode mode, std::optional<double> fromVisualOverride, bool deferFullscreenMutations) {
+    // All closing paths (selection, Escape, gesture, abort) relinquish input
+    // before their early exits; no ghost/settlement may retain the drag owner.
+    clearStripWindowDragState();
+    if (sessionLocked())
+        return;
+
     if (!isVisible())
         return;
 
@@ -11657,7 +11950,6 @@ void OverviewController::beginClose(CloseMode mode, std::optional<double> fromVi
     m_state.deferredFullscreenWorkspaceClear = false;
     m_state.deferredHiddenFullscreenReapply = false;
     m_deactivatePending = false;
-    clearHiddenStripLayerProxies();
     syncHiddenStripLayerProxies();
 
     if (debugLogsEnabled()) {
@@ -11773,7 +12065,7 @@ void OverviewController::beginClose(CloseMode mode, std::optional<double> fromVi
         if (preferGoalGeometry)
             refreshExitLayoutForFocus(m_state.pendingExitFocus);
         for (auto& managed : m_state.windows) {
-            if (!managed.window || !managed.window->m_isMapped)
+            if (!managed.window || !managed.window->mapped())
                 continue;
 
             managed.exitGlobal = preferGoalGeometry ? goalGlobalRectForWindow(managed.window) : liveGlobalRectForWindow(managed.window);
@@ -11830,7 +12122,27 @@ void OverviewController::beginClose(CloseMode mode, std::optional<double> fromVi
     damageOwnedMonitors();
 }
 
+void OverviewController::handleSessionLock() {
+    ++inputGeneration;
+    // Discard ownership without calling any gesture completion/commit path.
+    m_gestureSession = {};
+    m_scrollGestureSession = {};
+    m_workspaceSwipeGesture = {};
+    clearToggleSwitchSession();
+    clearOverviewWorkspaceTransition();
+    clearRelayoutProgressAnimation();
+    m_restoreScrollingFollowFocusAfterScrollMouseMove = false;
+    m_closeButtonPressLatched = false;
+    m_groupLabelPressLatched = false;
+    m_ignorePostCloseMouseMoveCount = 0;
+    m_state.closeMode = CloseMode::Abort;
+    m_state.pendingExitFocus.reset();
+    clearPostCloseDispatcher();
+    deactivate();
+}
+
 void OverviewController::deactivate() {
+    clearStripWindowDragState();
     cancelAndClearTimer(m_stripRefreshTimer);
     stopSearchInput();
     setDamageTrackingOverride(false);
@@ -11846,7 +12158,8 @@ void OverviewController::deactivate() {
     const auto* desiredFullscreenBackup = fullscreenBackupForWindow(m_state.pendingExitFocus);
     const auto originalFullscreenWindow = desiredFullscreenBackup ? desiredFullscreenBackup->originalFullscreenWindow : PHLWINDOW{};
     const auto originalFullscreenMode = desiredFullscreenBackup ? desiredFullscreenBackup->originalFullscreenMode : FSMODE_NONE;
-    const auto desiredFocus = m_state.closeMode != CloseMode::Abort && m_state.pendingExitFocus && m_state.pendingExitFocus->m_isMapped ? m_state.pendingExitFocus : PHLWINDOW{};
+    const auto desiredFocus = !sessionLocked() && m_state.closeMode != CloseMode::Abort && m_state.pendingExitFocus && m_state.pendingExitFocus->mapped() ? m_state.pendingExitFocus : PHLWINDOW{};
+    const auto postCloseNativeAction = desiredFocus ? m_postCloseNativeAction : decltype(m_postCloseNativeAction){};
     const auto postCloseDispatcher = desiredFocus ? m_postCloseDispatcher : PostCloseDispatcher::None;
     const auto postCloseDispatcherArgs = desiredFocus ? m_postCloseDispatcherArgs : std::string{};
     const bool shouldDelayRestoreNativeAnimations = m_animationsEnabledOverridden && m_state.closeMode != CloseMode::Abort;
@@ -11929,7 +12242,7 @@ void OverviewController::deactivate() {
     setFullscreenRenderOverride(false);
     restoreWorkspaceNameOverrides();
     setScrollingFollowFocusOverride(false);
-    g_pHyprRenderer->m_directScanoutBlocked = false;
+
 
     // Recommit after restoring native render/input hooks. The initial close
     // focus may have been refused or superseded during the closing animation.
@@ -11962,7 +12275,7 @@ void OverviewController::deactivate() {
     }
     if (desiredFocus && desiredFocus->m_workspace)
         emitWorkspaceActiveEvents(desiredFocus->m_workspace);
-    if (!m_state.exitFullscreenReapplied && desiredFocus && desiredFocus == originalFullscreenWindow && originalFullscreenMode != FSMODE_NONE && desiredFocus->m_isMapped) {
+    if (!m_state.exitFullscreenReapplied && desiredFocus && desiredFocus == originalFullscreenWindow && originalFullscreenMode != FSMODE_NONE && desiredFocus->mapped()) {
         if (debugLogsEnabled()) {
             std::ostringstream out;
             out << "[hymission] fullscreen restore check " << debugWindowLabel(desiredFocus) << " mode=" << static_cast<int>(originalFullscreenMode)
@@ -12016,6 +12329,9 @@ void OverviewController::deactivate() {
         monitor->scheduleFrame();
     }
 
+    if (postCloseNativeAction)
+        (void)postCloseNativeAction();
+
     switch (postCloseDispatcher) {
         case PostCloseDispatcher::Fullscreen:
             if (fullscreenActiveOriginal)
@@ -12040,15 +12356,16 @@ void OverviewController::scheduleDeactivate() {
         return;
 
     m_deactivateScheduled = true;
-    g_pEventLoopManager->doLater([this] {
-        if (g_controller != this)
+    const auto generation = inputGeneration;
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != inputGeneration)
             return;
 
         m_deactivateScheduled = false;
         if (!m_deactivatePending || !isVisible())
             return;
 
-        if (g_pHyprOpenGL && g_pHyprRenderer->m_renderData.pMonitor) {
+        if (g_pHyprOpenGL && renderContext().m_data.pMonitor) {
             scheduleDeactivate();
             return;
         }
@@ -12067,6 +12384,9 @@ void OverviewController::damageOwnedMonitors() const {
 }
 
 void OverviewController::updateAnimation() {
+    if (sessionLocked())
+        return;
+
     if (m_state.phase == Phase::ClosingSettle) {
         const auto now = std::chrono::steady_clock::now();
         if (m_state.settleStart == std::chrono::steady_clock::time_point{}) {
@@ -12090,7 +12410,7 @@ void OverviewController::updateAnimation() {
             if (m_state.deferredHiddenFullscreenReapply) {
                 m_state.deferredHiddenFullscreenReapply = false;
                 const auto* pendingFullscreenBackup = fullscreenBackupForWindow(m_state.pendingExitFocus);
-                const bool shouldReapplyOriginalFullscreen = m_state.pendingExitFocus && m_state.pendingExitFocus->m_isMapped && pendingFullscreenBackup &&
+                const bool shouldReapplyOriginalFullscreen = m_state.pendingExitFocus && m_state.pendingExitFocus->mapped() && pendingFullscreenBackup &&
                     m_state.pendingExitFocus == pendingFullscreenBackup->originalFullscreenWindow && pendingFullscreenBackup->originalFullscreenMode != FSMODE_NONE;
                 if (shouldReapplyOriginalFullscreen) {
                     if (debugLogsEnabled()) {
@@ -12118,7 +12438,7 @@ void OverviewController::updateAnimation() {
         const bool preferGoalGeometry = shouldPreferGoalExitGeometry(m_state.pendingExitFocus);
         bool stable = m_state.settleHasSample;
         for (auto& managed : m_state.windows) {
-            if (!managed.window || !managed.window->m_isMapped) {
+            if (!managed.window || !managed.window->mapped()) {
                 beginClose(CloseMode::Abort);
                 return;
             }
@@ -12463,7 +12783,7 @@ void OverviewController::updateHoveredFromPointer(bool syncSelection, bool syncR
                 const auto& entry = m_state.stripEntries[*m_state.hoveredStripIndex];
                 out << " strip=" << *m_state.hoveredStripIndex << ':' << entry.workspaceId;
                 if (entry.workspace)
-                    out << ':' << entry.workspace->m_name;
+                    out << ':' << entry.workspace->displayName();
                 else if (!entry.workspaceName.empty())
                     out << ':' << entry.workspaceName;
                 if (entry.newWorkspaceSlot)
@@ -12541,7 +12861,7 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
             out << " active=<null>";
         debugLog(out.str());
     }
-    State next = buildState(monitor, requestedScope, {}, m_searchActive, false, layoutSelectedWindow);
+    State next = buildState(monitor, requestedScope, {}, m_searchActive, false, layoutSelectedWindow, &m_state);
     if (!m_searchActive && next.windows.empty() && next.stripEntries.empty()) {
         beginClose(CloseMode::Abort);
         return;
@@ -12611,9 +12931,18 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
             const auto* previousManaged = previousManagedForItem(managed);
             return previousManaged && previousManaged->slot.rowGroup == managed.slot.rowGroup;
         });
-    const bool sameLayoutShape = sameWindowSet && sameMonitorSet && sameRowGroups;
-    const bool selectionRelayoutForced = forceRelayout && expandSelectedWindowEnabled();
-    const bool freezeExistingLayout = sameLayoutShape && !forceRelayout;
+    const bool sameTileLayouts = next.tileLayouts.size() == m_state.tileLayouts.size() &&
+        std::ranges::all_of(next.tileLayouts, [&](const State::TileLayout& tile) {
+            return std::ranges::any_of(m_state.tileLayouts, [&](const State::TileLayout& previous) {
+                return tile.monitor == previous.monitor && tile.id == previous.id && tile.workspace == previous.workspace &&
+                    rectApproxEqual(tile.content, previous.content, 0.001);
+            });
+        });
+    const bool sameLayoutShape = sameWindowSet && sameMonitorSet && sameRowGroups && sameTileLayouts;
+    const bool naturalGeometryRetained = next.engine == LayoutEngine::Natural && next.layoutSession.allRegionsRetained();
+    const bool freezeExistingLayout = sameLayoutShape && next.engine == m_state.engine &&
+        (next.engine == LayoutEngine::Natural ? naturalGeometryRetained : !forceRelayout);
+    const bool selectionRelayoutForced = forceRelayout && expandSelectedWindowEnabled() && !freezeExistingLayout;
 
     bool shouldAnimateRelayout = false;
     if (freezeExistingLayout) {
@@ -12625,7 +12954,7 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
             window.targetMonitor = previousManaged->targetMonitor;
             window.slot = previousManaged->slot;
             window.targetGlobal = previousManaged->targetGlobal;
-            window.relayoutFromGlobal = previousManaged->targetGlobal;
+            window.relayoutFromGlobal = naturalGeometryRetained ? previousManaged->relayoutFromGlobal : previousManaged->targetGlobal;
             window.exitGlobal = previousManaged->exitGlobal;
         }
     } else if (previousPhase == Phase::Active || selectionRelayoutForced) {
@@ -12645,7 +12974,7 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
     }
 
     auto appendTransientClosingWindow = [&](const ManagedWindow& source) {
-        if (!source.window || !source.window->m_isMapped || !isWindowFadingOut(source.window))
+        if (!source.window || !source.window->mapped() || !isWindowFadingOut(source.window))
             return;
         if (std::any_of(next.windows.begin(), next.windows.end(), [&](const ManagedWindow& managed) { return managed.window == source.window; }))
             return;
@@ -12662,7 +12991,7 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
             .relayoutFromGlobal = previewRect,
             .targetGlobal = previewRect,
             .slot = source.slot,
-            .previewAlpha = source.previewAlpha,
+            .previewAlphaWithoutActive = source.previewAlphaWithoutActive,
             .isFloating = source.isFloating,
             .isPinned = source.isPinned,
             .isNiriFloatingOverlay = source.isNiriFloatingOverlay,
@@ -12674,7 +13003,10 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
     for (const auto& window : m_state.transientClosingWindows)
         appendTransientClosingWindow(window);
 
-    if (freezeExistingLayout) {
+    if (freezeExistingLayout && naturalGeometryRetained) {
+        // Keep the in-flight ripple and its common animation clock. A passive
+        // native geometry notification must not cancel/restart a hover change.
+    } else if (freezeExistingLayout) {
         next.relayoutActive = false;
         next.relayoutProgress = 1.0;
         next.relayoutStart = {};
@@ -12725,7 +13057,9 @@ void OverviewController::rebuildVisibleState(PHLWINDOW preferredSelectedWindow, 
     carryOverWorkspaceStripSnapshots(next, m_state);
     restoreOverviewRenderState();
     m_state = std::move(next);
-    clearRelayoutProgressAnimation();
+    sendSearchResultCount();
+    if (!freezeExistingLayout || !naturalGeometryRetained)
+        clearRelayoutProgressAnimation();
     armOverviewRenderState(m_state);
     applyWorkspaceNameOverrides(m_state);
     syncHiddenStripLayerProxies();
@@ -12981,6 +13315,7 @@ bool OverviewController::handleSpatialPickLabelKey(std::size_t keyIndex) {
 }
 
 void OverviewController::clearStripWindowDragState() {
+    if (auto* tiles=TilesController::get()) tiles->release(TilesController::Owner::OverviewDrag);
     m_pressedStripIndex.reset();
     m_pressedWindowIndex.reset();
     m_draggedWindowIndex.reset();
@@ -13005,7 +13340,7 @@ void OverviewController::clearStripWindowDragState() {
 
 void OverviewController::activateStripTarget(std::size_t index) {
     // Force-all keeps the strip as a drag target without switching workspaces on click.
-    if (m_state.collectionPolicy.requestedScope == ScopeOverride::ForceAll)
+    if (m_state.collectionPolicy.requestedScope == ScopeOverride::ForceAll && (index>=m_state.stripEntries.size() || !m_state.stripEntries[index].tileId))
         return;
 
     if (index >= m_state.stripEntries.size())
@@ -13017,8 +13352,17 @@ void OverviewController::activateStripTarget(std::size_t index) {
     if (!entry.monitor || entry.workspaceId == WORKSPACE_INVALID)
         return;
 
-    auto targetWorkspace = entry.workspace ? entry.workspace : ::State::workspaceState()->query().id(entry.workspaceId).run();
-    if (targetWorkspace && targetWorkspace->m_isSpecialWorkspace)
+    auto targetWorkspace = entry.workspace ? entry.workspace : workspaceForKey(entry.workspaceId);
+    if (entry.tileId && TilesController::get()) {
+        const auto monitor=entry.monitor; const auto id=entry.tileId; const auto key=entry.workspaceId;
+        if (!targetWorkspace) targetWorkspace=createWorkspaceForKey(key,monitor->m_id);
+        if (targetWorkspace && TilesController::get()->activate(monitor,id,targetWorkspace)) {
+            if (isVisible() && m_state.phase==Phase::Active) rebuildVisibleState({},true);
+            damageOwnedMonitors();
+        }
+        return;
+    }
+    if (targetWorkspace && (targetWorkspace->type() == Workspace::eWorkspaceType::SPECIAL))
         return;
 
     if (targetWorkspace && entry.monitor->m_activeWorkspace == targetWorkspace) {
@@ -13086,13 +13430,9 @@ void OverviewController::debugLog(const std::string& message) const {
         return;
 
     if (Log::logger)
-        Log::logger->log(Log::DEBUG, message);
+        LOG(Log::DEBUG, escapeLogControls(message));
 
-    std::ofstream out("/tmp/hymission-debug.log", std::ios::app);
-    if (!out.is_open())
-        return;
-
-    out << message << '\n';
+    appendPrivateDebugLog(message);
 }
 
 void OverviewController::debugSurfaceLog(const std::string& message) const {
@@ -13100,13 +13440,9 @@ void OverviewController::debugSurfaceLog(const std::string& message) const {
         return;
 
     if (Log::logger)
-        Log::logger->log(Log::DEBUG, message);
+        LOG(Log::DEBUG, escapeLogControls(message));
 
-    std::ofstream out("/tmp/hymission-debug.log", std::ios::app);
-    if (!out.is_open())
-        return;
-
-    out << message << '\n';
+    appendPrivateDebugLog(message);
 }
 
 std::string OverviewController::debugWorkspaceLabel(const PHLWORKSPACE& workspace) const {
@@ -13114,8 +13450,8 @@ std::string OverviewController::debugWorkspaceLabel(const PHLWORKSPACE& workspac
         return "<null-workspace>";
 
     std::ostringstream out;
-    out << workspace->m_id << ':' << workspace->m_name;
-    if (workspace->m_isSpecialWorkspace)
+    out << workspaceKey(workspace) << ':' << workspace->displayName();
+    if ((workspace->type() == Workspace::eWorkspaceType::SPECIAL))
         out << " special";
     if (const auto monitor = workspace->m_monitor.lock())
         out << "@" << monitor->m_name;
@@ -13138,8 +13474,8 @@ std::string OverviewController::debugWindowLabel(const PHLWINDOW& window) const 
         return "<null-window>";
 
     std::ostringstream out;
-    out << window->m_class << "::" << window->m_title << '@' << std::hex << reinterpret_cast<uintptr_t>(window.get()) << std::dec
-        << (window->m_isX11 ? " x11" : " wayland");
+    out << window->metadata().appID() << "::" << window->metadata().title() << '@' << std::hex << reinterpret_cast<uintptr_t>(window.get()) << std::dec
+        << (window->backend().isX11() ? " x11" : " wayland");
     return out.str();
 }
 
@@ -13256,7 +13592,7 @@ void OverviewController::logScrollingWorkspaceSpotState(const char* context, con
     std::ostringstream summary;
     summary << "[hymission] scrolling spot dump context=" << (context ? context : "?")
             << " workspace=" << debugWorkspaceLabel(workspace)
-            << " visible=" << (workspace->isVisible() ? 1 : 0)
+            << " visible=" << (workspace->visible() ? 1 : 0)
             << " columns=" << data->columns.size()
             << " offset=" << data->controller->getOffset();
     if (data->lockedCameraOffset)
@@ -13313,7 +13649,7 @@ void OverviewController::logScrollingWorkspaceSpotState(const char* context, con
 bool OverviewController::workspaceStripEntriesMatchForSnapshot(const WorkspaceStripEntry& lhs, const WorkspaceStripEntry& rhs) const {
     const auto lhsMonitorId = lhs.monitor ? lhs.monitor->m_id : MONITOR_INVALID;
     const auto rhsMonitorId = rhs.monitor ? rhs.monitor->m_id : MONITOR_INVALID;
-    if (lhsMonitorId != rhsMonitorId)
+    if (lhsMonitorId != rhsMonitorId || lhs.tileId!=rhs.tileId)
         return false;
 
     if (lhs.newWorkspaceSlot != rhs.newWorkspaceSlot)
@@ -13359,7 +13695,7 @@ void OverviewController::renderBackdrop() const {
     if (color.a <= 0.0 && !blur)
         return;
 
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     if (!monitor)
         return;
 
@@ -13372,7 +13708,7 @@ void OverviewController::renderBackdrop() const {
     data.color = color;
     data.blur = blur;
     data.blurA = static_cast<float>(std::clamp(progress, 0.0, 1.0));
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(data));
+    renderContext().m_pass.add(makeUnique<CRectPassElement>(data));
 }
 
 void OverviewController::renderSelectionChrome() const {
@@ -13380,7 +13716,7 @@ void OverviewController::renderSelectionChrome() const {
     if (progress <= 0.0 || m_draggedWindowIndex)
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -13438,7 +13774,7 @@ void OverviewController::renderSelectionChrome() const {
                 const Rect titleRect =
                     makeRect(rect.x, std::max(scaleLengthForRender(renderMonitor, 8.0), rect.y - texture->m_size.y - scaleLengthForRender(renderMonitor, TITLE_PADDING)),
                              texture->m_size.x, texture->m_size.y);
-                g_pHyprOpenGL->renderTexture(texture, toBox(titleRect), {});
+                g_pHyprOpenGL->renderTexture(renderContext(), texture, toBox(titleRect), {});
             }
         }
     }
@@ -13484,7 +13820,7 @@ void OverviewController::renderDraggedWindowPreview() const {
     if (!window || !monitor || !texture || preview.width <= 0.0 || preview.height <= 0.0 || alpha <= 0.001)
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor || renderMonitor != monitor)
         return;
 
@@ -13492,9 +13828,9 @@ void OverviewController::renderDraggedWindowPreview() const {
 
     const Rect local = rectToMonitorRenderLocal(preview, renderMonitor);
     const double renderScale = renderScaleForMonitor(renderMonitor);
-    const int rounding = std::max(0, static_cast<int>(std::lround(static_cast<double>(window->rounding()) * decorationScale * renderScale)));
-    const float roundingPower = static_cast<float>(window->roundingPower());
-    g_pHyprOpenGL->renderTexture(texture, toBox(local), {.a = static_cast<float>(alpha), .round = rounding, .roundingPower = roundingPower});
+    const int rounding = std::max(0, static_cast<int>(std::lround(static_cast<double>(window->presentation().rounding()) * decorationScale * renderScale)));
+    const float roundingPower = static_cast<float>(window->presentation().roundingPower());
+    g_pHyprOpenGL->renderTexture(renderContext(), texture, toBox(local), {.a = static_cast<float>(alpha), .round = rounding, .roundingPower = roundingPower});
 
     renderOverviewBorderForRect(window, renderMonitor, preview, static_cast<float>(alpha), decorationScale, true);
 }
@@ -13545,8 +13881,8 @@ void OverviewController::refreshDraggedWindowCompositeTexture() {
         return;
 
     const auto& dragged = m_state.windows[*m_draggedWindowIndex];
-    const auto  renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
-    const auto  sourceFramebuffer = g_pHyprRenderer->m_renderData.currentFB;
+    const auto  renderMonitor = renderContext().m_data.pMonitor.lock();
+    const auto  sourceFramebuffer = renderContext().m_data.currentFB;
     if (!dragged.window || !dragged.targetMonitor || !renderMonitor || renderMonitor != dragged.targetMonitor || !sourceFramebuffer ||
         !sourceFramebuffer->isAllocated())
         return;
@@ -13613,7 +13949,7 @@ bool OverviewController::switchCollapsedGroupMember(std::size_t windowIndex, std
 
     const auto group = managed.group;
     const auto member = group->fromIndex(memberIndex);
-    if (!member || !member->m_isMapped)
+    if (!member || !member->mapped())
         return false;
 
     if (managed.window == member && group->current() == member)
@@ -13625,12 +13961,12 @@ bool OverviewController::switchCollapsedGroupMember(std::size_t windowIndex, std
     // bound, those callbacks can only render it at the existing overview slot.
     const ManagedWindow previous = managed;
     managed.window = member;
-    managed.title = member->m_title;
+    managed.title = member->metadata().title();
     managed.groupMembers = group->windows();
     managed.groupCurrentIndex = memberIndex;
-    managed.previewAlpha = overviewPreviewAlphaForWindow(member, true);
-    managed.isFloating = member->m_isFloating;
-    managed.isPinned = member->m_pinned;
+    managed.previewAlphaWithoutActive = overviewPreviewAlphaForWindow(member, true, true);
+    managed.isFloating = member->isFloating();
+    managed.isPinned = static_cast<bool>(member->m_state & Desktop::View::WINDOW_STATE_PINNED);
 
     group->setCurrent(memberIndex);
     if (group->current() != member) {
@@ -13662,7 +13998,7 @@ void OverviewController::renderCollapsedGroupLabels() const {
         return;
 
     const double progress = visualProgress();
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor = renderContext().m_data.pMonitor.lock();
     if (!monitor || progress <= 0.0)
         return;
 
@@ -13677,7 +14013,7 @@ void OverviewController::renderCollapsedGroupLabels() const {
             continue;
 
         const int outerRound = std::max(4, static_cast<int>(std::lround(scaleLengthForRender(monitor, 8.0))));
-        g_pHyprOpenGL->renderRect(toBox(bar), colorWithAlphaMultiplier(closeButtonColor(), progress * 0.94), {.round = outerRound});
+        g_pHyprOpenGL->renderRect(renderContext(), toBox(bar), colorWithAlphaMultiplier(closeButtonColor(), progress * 0.94), {.round = outerRound});
 
         const std::size_t current = managed.group ? managed.group->getCurrentIdx() : managed.groupCurrentIndex;
         for (std::size_t memberIndex = 0; memberIndex < managed.groupMembers.size(); ++memberIndex) {
@@ -13685,13 +14021,13 @@ void OverviewController::renderCollapsedGroupLabels() const {
             const Rect segment = makeRect(bar.x + segmentWidth * static_cast<double>(memberIndex), bar.y, segmentWidth, bar.height);
             if (memberIndex == current) {
                 const Rect active = makeRect(segment.x + 2.0, segment.y + 2.0, std::max(1.0, segment.width - 4.0), std::max(1.0, segment.height - 4.0));
-                g_pHyprOpenGL->renderRect(toBox(active), colorWithAlphaMultiplier(focusSelectedColor(), progress * 0.24), {.round = std::max(3, outerRound - 2)});
+                g_pHyprOpenGL->renderRect(renderContext(), toBox(active), colorWithAlphaMultiplier(focusSelectedColor(), progress * 0.24), {.round = std::max(3, outerRound - 2)});
             } else if (memberIndex > 0) {
                 const Rect divider = makeRect(segment.x, segment.y + 6.0, 1.0, std::max(1.0, segment.height - 12.0));
-                g_pHyprOpenGL->renderRect(toBox(divider), colorWithAlphaMultiplier(focusTitleColor(), progress * 0.14), {});
+                g_pHyprOpenGL->renderRect(renderContext(), toBox(divider), colorWithAlphaMultiplier(focusTitleColor(), progress * 0.14), {});
             }
 
-            const std::string title = member && !member->m_title.empty() ? member->m_title : std::to_string(memberIndex + 1);
+            const std::string title = member && !member->metadata().title().empty() ? member->metadata().title() : std::to_string(memberIndex + 1);
             const double pad = scaleLengthForRender(monitor, 8.0);
             const int maxWidth = std::max(1, static_cast<int>(std::floor(segment.width - pad * 2.0)));
             auto texture = g_pHyprRenderer->renderText(title, colorWithAlphaMultiplier(focusTitleColor(), progress * (memberIndex == current ? 1.0 : 0.66)),
@@ -13700,7 +14036,7 @@ void OverviewController::renderCollapsedGroupLabels() const {
                 continue;
             const Rect textRect = makeRect(segment.x + pad, segment.y + (segment.height - texture->m_size.y) * 0.5,
                                            std::min<double>(texture->m_size.x, maxWidth), texture->m_size.y);
-            g_pHyprOpenGL->renderTexture(texture, toBox(textRect), {});
+            g_pHyprOpenGL->renderTexture(renderContext(), texture, toBox(textRect), {});
         }
     }
 }
@@ -13713,7 +14049,7 @@ void OverviewController::renderPickLabels() const {
     if (progress <= 0.0)
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -13773,10 +14109,10 @@ void OverviewController::renderPickLabels() const {
         const double chipH = texture->m_size.y + pad * 2.0;
         const Rect   chipLocal = makeRect(rectLocal.x + rectLocal.width - chipW - pad, rectLocal.y + pad, chipW, chipH);
 
-        g_pHyprOpenGL->renderRect(toBox(chipLocal), chipColor, {.round = static_cast<int>(pad)});
+        g_pHyprOpenGL->renderRect(renderContext(), toBox(chipLocal), chipColor, {.round = static_cast<int>(pad)});
 
         const Rect textLocal = makeRect(chipLocal.x + pad, chipLocal.y + pad, texture->m_size.x, texture->m_size.y);
-        g_pHyprOpenGL->renderTexture(texture, toBox(textLocal), {});
+        g_pHyprOpenGL->renderTexture(renderContext(), texture, toBox(textLocal), {});
     }
 }
 
@@ -13788,7 +14124,7 @@ void OverviewController::renderCloseButtons() const {
     if (progress <= 0.0 || m_state.phase != Phase::Active)
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -13821,7 +14157,7 @@ void OverviewController::renderCloseButtons() const {
         const bool hovered   = m_state.hoveredCloseIndex && *m_state.hoveredCloseIndex == index;
 
         // Disk: square rect rounded to half its side becomes a circle.
-        g_pHyprOpenGL->renderRect(toBox(rectLocal), hovered ? hoverFill : idleFill, {.round = static_cast<int>(std::round(rectLocal.width * 0.5))});
+        g_pHyprOpenGL->renderRect(renderContext(), toBox(rectLocal), hovered ? hoverFill : idleFill, {.round = static_cast<int>(std::round(rectLocal.width * 0.5))});
 
         // X strokes: two diagonals across an inner box. Drawn as a high
         // density of small overlapping squares along each line - cheap,
@@ -13842,16 +14178,16 @@ void OverviewController::renderCloseButtons() const {
             const double t = static_cast<double>(s) / static_cast<double>(samples);
             const double x1 = xL + (xR - xL) * t;
             const double y1 = yT + (yB - yT) * t;
-            g_pHyprOpenGL->renderRect(toBox(makeRect(x1 - stroke * 0.5, y1 - stroke * 0.5, stroke, stroke)), glyphCol, {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(makeRect(x1 - stroke * 0.5, y1 - stroke * 0.5, stroke, stroke)), glyphCol, {});
             const double x2 = xR - (xR - xL) * t;
             const double y2 = yT + (yB - yT) * t;
-            g_pHyprOpenGL->renderRect(toBox(makeRect(x2 - stroke * 0.5, y2 - stroke * 0.5, stroke, stroke)), glyphCol, {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(makeRect(x2 - stroke * 0.5, y2 - stroke * 0.5, stroke, stroke)), glyphCol, {});
         }
     }
 }
 
 void OverviewController::renderOutline(const Rect& rect, const CHyprColor& color, double thickness) const {
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -13862,10 +14198,10 @@ void OverviewController::renderOutline(const Rect& rect, const CHyprColor& color
     const Rect left = makeRect(local.x - scaledThickness, local.y, scaledThickness, local.height);
     const Rect right = makeRect(local.x + local.width, local.y, scaledThickness, local.height);
 
-    g_pHyprOpenGL->renderRect(toBox(top), color, {});
-    g_pHyprOpenGL->renderRect(toBox(bottom), color, {});
-    g_pHyprOpenGL->renderRect(toBox(left), color, {});
-    g_pHyprOpenGL->renderRect(toBox(right), color, {});
+    g_pHyprOpenGL->renderRect(renderContext(), toBox(top), color, {});
+    g_pHyprOpenGL->renderRect(renderContext(), toBox(bottom), color, {});
+    g_pHyprOpenGL->renderRect(renderContext(), toBox(left), color, {});
+    g_pHyprOpenGL->renderRect(renderContext(), toBox(right), color, {});
 }
 
 Rect OverviewController::workspaceStripThumbRect(const WorkspaceStripEntry& entry, const PHLMONITOR& monitor) const {
@@ -13897,9 +14233,12 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
     if (thumb.width < 4.0 || thumb.height < 4.0)
         return;
 
-    const int fbWidth = std::max(1, static_cast<int>(std::ceil(thumb.width * entry.monitor->m_scale)));
+    double captureWidth=thumb.width*entry.monitor->m_scale;
+    if (entry.tileId && TilesController::get()) for (const auto& view:TilesController::get()->views(entry.monitor)) if (view.id==entry.tileId)
+        captureWidth*=entry.monitor->m_size.x/std::max(1.0,view.allocation.w);
+    const int fbWidth = std::max(1, static_cast<int>(std::ceil(captureWidth)));
     const int fbHeight = std::max(1, static_cast<int>(std::ceil(thumb.height * entry.monitor->m_scale)));
-    using RenderWindowFn = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+    using RenderWindowFn = void (*)(Render::IHyprRenderer*, Render::CRenderContext&, PHLWINDOW, PHLMONITOR, const Render::SWindowRenderPresentation&, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
 
     static RenderWindowFn renderWindowFn = nullptr;
     static bool           renderWindowResolved = false;
@@ -13911,12 +14250,16 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
     }
 
     const auto monitor = entry.monitor;
-    const auto targetWorkspace = entry.workspace ? entry.workspace : ::State::workspaceState()->query().id(entry.workspaceId).run();
+    const auto targetWorkspace = entry.workspace ? entry.workspace : workspaceForKey(entry.workspaceId);
     if (!targetWorkspace && !entry.syntheticEmpty)
         return;
+    // Fake rendering copies the monitor's work buffer without a color resolve.
+    // HDR uses extended linear values: retain FP16 through both rendering and
+    // thumbnail blits instead of clipping/quantizing them into default RGBA8.
+    const auto snapshotFormat = monitor->useFP16() ? DRM_FORMAT_ABGR16161616F : DRM_FORMAT_ARGB8888;
     auto snapshot = std::make_shared<WorkspaceStripEntry::Snapshot>();
     snapshot->framebuffer = createFramebuffer("hymission workspace strip snapshot");
-    if (!snapshot->framebuffer || !snapshot->framebuffer->alloc(fbWidth, fbHeight))
+    if (!snapshot->framebuffer || !snapshot->framebuffer->alloc(fbWidth, fbHeight, snapshotFormat))
         return;
     snapshot->framebuffer->setImageDescription(monitor->workBufferImageDescription());
     setFramebufferLinearFiltering(*snapshot->framebuffer);
@@ -13941,6 +14284,8 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
             previewState.participatingMonitors = {monitor};
             previewState.focusDuringOverview = Desktop::focusState()->window();
         }
+        if (entry.tileId && targetWorkspace)
+            std::erase_if(previewState.windows,[&](const auto& managed) { return managed.window->m_workspace!=targetWorkspace; });
         previewState.phase = Phase::Active;
         previewState.animationProgress = 1.0;
         previewState.animationFromVisual = 1.0;
@@ -13967,22 +14312,23 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
                 previewState.windows.push_back({
                     .window = draggedWindow,
                     .targetMonitor = monitor,
-                    .title = draggedWindow->m_title,
+                    .title = draggedWindow->metadata().title(),
                     .naturalGlobal = naturalGlobal,
                     .exitGlobal = naturalGlobal,
                     .relayoutFromGlobal = naturalGlobal,
                     .targetGlobal = naturalGlobal,
                     .slot = {.index = index},
-                    .previewAlpha = overviewPreviewAlphaForWindow(draggedWindow, static_cast<bool>(draggedWindow->m_group)),
-                    .isFloating = draggedWindow->m_isFloating,
-                    .isPinned = draggedWindow->m_pinned,
-                    .group = draggedWindow->m_group,
-                    .groupMembers = draggedWindow->m_group ? draggedWindow->m_group->windows() : std::vector<PHLWINDOWREF>{},
-                    .groupCurrentIndex = draggedWindow->m_group ? draggedWindow->m_group->getCurrentIdx() : 0,
+                    .previewAlphaWithoutActive = overviewPreviewAlphaForWindow(draggedWindow, static_cast<bool>(draggedWindow->grouping().group()), true),
+                    .isFloating = draggedWindow->isFloating(),
+                    .isPinned = static_cast<bool>(draggedWindow->m_state & Desktop::View::WINDOW_STATE_PINNED),
+                    .group = draggedWindow->grouping().group(),
+                    .groupMembers = draggedWindow->grouping().group() ? draggedWindow->grouping().group()->windows() : std::vector<PHLWINDOWREF>{},
+                    .groupCurrentIndex = draggedWindow->grouping().group() ? draggedWindow->grouping().group()->getCurrentIdx() : 0,
                 });
             }
 
             LayoutConfig previewConfig = layoutConfigForState(previewState);
+            previewState.engine = previewConfig.engine;
             previewConfig.forceRowGroups = false;
             previewConfig.preserveInputOrder = true;
             std::vector<WindowInput> previewInputs;
@@ -13990,11 +14336,8 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
             for (std::size_t previewIndex = 0; previewIndex < previewState.windows.size(); ++previewIndex) {
                 const auto& managed = previewState.windows[previewIndex];
                 const Rect outer = overviewBorderOuterRectForWindow(managed.window, managed.naturalGlobal);
-                previewInputs.push_back({
-                    .index = previewIndex,
-                    .natural = makeRect(outer.x - monitor->m_position.x, outer.y - monitor->m_position.y, outer.width, outer.height),
-                    .label = managed.title,
-                });
+                previewInputs.push_back(layoutInputForWindow(previewState, managed.window,
+                    makeRect(outer.x - monitor->m_position.x, outer.y - monitor->m_position.y, outer.width, outer.height), previewIndex));
             }
 
             MissionControlLayout previewLayout;
@@ -14042,7 +14385,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
                 previewState.windows.push_back({
                     .window = preview.window,
                     .targetMonitor = monitor,
-                    .title = preview.window->m_title,
+                    .title = preview.window->metadata().title(),
                     .naturalGlobal = preview.naturalGlobal,
                     .exitGlobal = preview.naturalGlobal,
                     .relayoutFromGlobal = preview.naturalGlobal,
@@ -14054,10 +14397,23 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
                             .target = local,
                             .scale = 1.0,
                         },
-                    .previewAlpha = preview.alpha,
-                    .isFloating = preview.window->m_isFloating,
-                    .isPinned = preview.window->m_pinned,
+                    .previewAlphaWithoutActive = overviewPreviewAlphaForWindow(preview.window, false, true),
+                    .isFloating = preview.window->isFloating(),
+                    .isPinned = static_cast<bool>(preview.window->m_state & Desktop::View::WINDOW_STATE_PINNED),
                 });
+            }
+        }
+
+        if (!entryIsHoveredDragTarget) {
+            // A strip card is the current desktop, not a second overview layout.
+            // Re-sample every refresh (including native scrolling camera motion)
+            // independently of the main region's frozen FB7 layout session.
+            for (auto& managed : previewState.windows) {
+                const auto geometry = stateSnapshotGlobalRectForWindow(managed.window, shouldUseGoalGeometryForStateSnapshot(managed.window));
+                managed.naturalGlobal = managed.exitGlobal = managed.relayoutFromGlobal = managed.targetGlobal = geometry;
+                const auto local = rectToMonitorLocal(geometry, monitor);
+                managed.slot.natural = managed.slot.target = local;
+                managed.slot.scale = 1.0;
             }
         }
 
@@ -14071,9 +14427,9 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
 
     const auto previousWorkspace = monitor->m_activeWorkspace;
     const auto previousSpecialWorkspace = monitor->m_activeSpecialWorkspace;
-    const bool previousBlockSurfaceFeedback = g_pHyprRenderer->m_bBlockSurfaceFeedback;
-    const bool previousBlockScreenShader = g_pHyprRenderer->m_renderData.blockScreenShader;
-    const bool previousRenderingSnapshot = g_pHyprRenderer->m_bRenderingSnapshot;
+    const bool previousBlockSurfaceFeedback = renderContext().m_blockSurfaceFeedback;
+    const bool previousBlockScreenShader = renderContext().m_data.blockScreenShader;
+    const bool previousRenderingSnapshot = renderContext().m_renderingSnapshot;
     struct WorkspaceRenderState {
         PHLWORKSPACE workspace;
         bool         visible = false;
@@ -14087,7 +14443,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
             return std::nullopt;
         return WorkspaceRenderState{
             .workspace = workspace,
-            .visible = workspace->m_visible,
+            .visible = workspace->visible(),
             .renderOffsetValue = workspace->m_renderOffset->value(),
             .renderOffsetGoal = workspace->m_renderOffset->goal(),
             .alphaValue = workspace->m_alpha->value(),
@@ -14098,7 +14454,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
         if (!state || !state->workspace)
             return;
 
-        state->workspace->m_visible = state->visible;
+        state->workspace->setVisible(state->visible);
         state->workspace->m_renderOffset->setValueAndWarp(state->renderOffsetValue);
         if (state->renderOffsetGoal != state->renderOffsetValue)
             *state->workspace->m_renderOffset = state->renderOffsetGoal;
@@ -14145,14 +14501,14 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
 
         for (const auto layerKind : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
             for (const auto& layer : Desktop::viewState()->layers()) {
-                if (!layer || !layer->m_mapped || layer->m_noProcess)
+                if (!layer || !layer->mapped() || static_cast<bool>(layer->m_flags & Desktop::View::LAYER_FLAG_DEAD))
                     continue;
 
                 const auto layerMonitor = layer->m_monitor.lock();
                 if (!layerMonitor || layerMonitor != monitor || layer->m_layer != static_cast<int>(layerKind))
                     continue;
 
-                m_renderLayerOriginal(g_pHyprRenderer.get(), layer, monitor, now, false, false);
+                m_renderLayerOriginal(g_pHyprRenderer.get(), renderContext(), layer, monitor, now, false, false, false);
             }
         }
     };
@@ -14161,31 +14517,31 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
         if (!targetFramebuffer)
             return false;
 
-        const bool previousBlockScreenShaderLocal = g_pHyprRenderer->m_renderData.blockScreenShader;
+        const bool previousBlockScreenShaderLocal = renderContext().m_data.blockScreenShader;
         CRegion     fakeDamage{0, 0, static_cast<int>(std::lround(monitor->m_transformedSize.x)), static_cast<int>(std::lround(monitor->m_transformedSize.y))};
         if (!g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, targetFramebuffer)) {
-            g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShaderLocal;
+            renderContext().m_data.blockScreenShader = previousBlockScreenShaderLocal;
             return false;
         }
 
         g_pHyprRenderer->setViewport(0, 0, static_cast<int>(std::lround(targetFramebuffer->m_size.x)),
                                      static_cast<int>(std::lround(targetFramebuffer->m_size.y)));
-        g_pHyprRenderer->m_renderData.blockScreenShader = true;
+        renderContext().m_data.blockScreenShader = true;
         // Window and layer geometry is already expressed in transformed monitor
         // space. Render it directly into the logical-orientation framebuffer.
-        g_pHyprRenderer->m_renderData.fbSize = targetFramebuffer->m_size;
-        g_pHyprRenderer->m_renderData.transformDamage = false;
-        g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-        g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
+        renderContext().m_data.fbSize = targetFramebuffer->m_size;
+        renderContext().m_data.transformDamage = false;
+        g_pHyprRenderer->setProjectionType(renderContext(), Render::RPT_EXPORT);
+        g_pHyprRenderer->draw(renderContext(), CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
         renderBackgroundLayers(now);
         g_pHyprRenderer->endRender();
-        g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShaderLocal;
+        renderContext().m_data.blockScreenShader = previousBlockScreenShaderLocal;
         return true;
     };
 
     ++m_stripSnapshotRenderDepth;
     g_pHyprOpenGL->makeEGLCurrent();
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
+    renderContext().m_blockSurfaceFeedback = true;
     if (renderWorkspaceContents) {
         m_stripPreviewContext.active = true;
         m_stripPreviewContext.monitor = monitor;
@@ -14199,8 +14555,8 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
 
     if (renderWorkspaceContents && targetWorkspace && !targetIsCurrentWorkspace) {
         monitor->m_activeWorkspace = targetWorkspace;
-        if (!targetWorkspace->m_visible) {
-            targetWorkspace->m_visible = true;
+        if (!targetWorkspace->visible()) {
+            targetWorkspace->setVisible(true);
             targetVisibilityChanged = true;
         }
         targetWorkspace->m_renderOffset->setValueAndWarp(Vector2D{});
@@ -14213,7 +14569,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
         const int backgroundFbWidth = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.x)));
         const int backgroundFbHeight = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.y)));
         auto      backgroundFramebuffer = createFramebuffer("hymission workspace strip background");
-        if (backgroundFramebuffer && backgroundFramebuffer->alloc(backgroundFbWidth, backgroundFbHeight)) {
+        if (backgroundFramebuffer && backgroundFramebuffer->alloc(backgroundFbWidth, backgroundFbHeight, snapshotFormat)) {
             backgroundFramebuffer->setImageDescription(monitor->workBufferImageDescription());
             setFramebufferLinearFiltering(*backgroundFramebuffer);
             renderedScaledBackgroundOnly = renderBackgroundLayersIntoFramebuffer(backgroundFramebuffer, renderNow) &&
@@ -14230,7 +14586,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
             const int renderFbWidth = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.x)));
             const int renderFbHeight = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.y)));
             auto      fullSizeFramebuffer = createFramebuffer("hymission workspace strip full snapshot");
-            if (fullSizeFramebuffer && fullSizeFramebuffer->alloc(renderFbWidth, renderFbHeight)) {
+            if (fullSizeFramebuffer && fullSizeFramebuffer->alloc(renderFbWidth, renderFbHeight, snapshotFormat)) {
                 fullSizeFramebuffer->setImageDescription(monitor->workBufferImageDescription());
                 setFramebufferLinearFiltering(*fullSizeFramebuffer);
                 renderFramebuffer = fullSizeFramebuffer;
@@ -14243,28 +14599,28 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
         g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, renderFramebuffer);
         g_pHyprRenderer->setViewport(0, 0, static_cast<int>(std::lround(renderFramebuffer->m_size.x)),
                                      static_cast<int>(std::lround(renderFramebuffer->m_size.y)));
-        g_pHyprRenderer->m_renderData.fbSize = renderFramebuffer->m_size;
-        g_pHyprRenderer->m_renderData.transformDamage = false;
-        g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-        g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
+        renderContext().m_data.fbSize = renderFramebuffer->m_size;
+        renderContext().m_data.transformDamage = false;
+        g_pHyprRenderer->setProjectionType(renderContext(), Render::RPT_EXPORT);
+        g_pHyprRenderer->draw(renderContext(), CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
         renderBackgroundLayers(renderNow);
         if (renderWorkspaceContents && renderWindowFn) {
-            g_pHyprRenderer->m_bRenderingSnapshot = true;
+            renderContext().m_renderingSnapshot = true;
             const auto renderPreviewWindows = [&](bool floating) {
                 for (const auto& managed : m_stripPreviewContext.state.windows) {
                     if (!managed.window || managed.isFloating != floating)
                         continue;
 
-                    renderWindowFn(g_pHyprRenderer.get(), managed.window, monitor, renderNow, false, Render::RENDER_PASS_ALL, false, true);
+                    renderWindowFn(g_pHyprRenderer.get(), renderContext(), managed.window, monitor, managed.window->presentation().renderPresentation(), renderNow, false, Render::RENDER_PASS_ALL, false, true);
                 }
             };
             renderPreviewWindows(false);
             renderPreviewWindows(true);
-            g_pHyprRenderer->m_bRenderingSnapshot = previousRenderingSnapshot;
+            renderContext().m_renderingSnapshot = previousRenderingSnapshot;
         }
-        g_pHyprRenderer->m_renderData.blockScreenShader = true;
+        renderContext().m_data.blockScreenShader = true;
         g_pHyprRenderer->endRender();
-        g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShader;
+        renderContext().m_data.blockScreenShader = previousBlockScreenShader;
 
         if (blitRenderedFramebuffer) {
             blitFramebufferRegion(*renderFramebuffer, *snapshot->framebuffer,
@@ -14281,7 +14637,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
     }
 
     if (targetVisibilityChanged && targetWorkspace)
-        targetWorkspace->m_visible = false;
+        targetWorkspace->setVisible(false);
 
     if (renderWorkspaceContents && !targetIsCurrentWorkspace) {
         monitor->m_activeSpecialWorkspace = previousSpecialWorkspace;
@@ -14291,8 +14647,8 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
     restoreWorkspaceRenderState(previousWorkspaceRenderState);
     restoreWorkspaceRenderState(targetWorkspaceRenderState);
 
-    g_pHyprRenderer->m_bRenderingSnapshot = previousRenderingSnapshot;
-    g_pHyprRenderer->m_bBlockSurfaceFeedback = previousBlockSurfaceFeedback;
+    renderContext().m_renderingSnapshot = previousRenderingSnapshot;
+    renderContext().m_blockSurfaceFeedback = previousBlockSurfaceFeedback;
     --m_stripSnapshotRenderDepth;
 
     snapshot->dropPreview = entryIsHoveredDragTarget;
@@ -14335,32 +14691,32 @@ std::string OverviewController::renderBackgroundIntoFramebuffer(const PHLMONITOR
     const int height = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.y)));
     targetFramebuffer->setImageDescription(monitor->workBufferImageDescription());
     setFramebufferLinearFiltering(*targetFramebuffer);
-    const bool previousBlockScreenShader = g_pHyprRenderer->m_renderData.blockScreenShader;
+    const bool previousBlockScreenShader = renderContext().m_data.blockScreenShader;
     CRegion fakeDamage{0, 0, width, height};
     if (!g_pHyprRenderer->beginFullFakeRender(monitor, fakeDamage, targetFramebuffer)) {
-        g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShader;
+        renderContext().m_data.blockScreenShader = previousBlockScreenShader;
         return "beginFullFakeRender failed";
     }
     g_pHyprRenderer->setViewport(0, 0, static_cast<int>(std::lround(targetFramebuffer->m_size.x)),
                                  static_cast<int>(std::lround(targetFramebuffer->m_size.y)));
-    g_pHyprRenderer->m_renderData.blockScreenShader = true;
-    g_pHyprRenderer->m_renderData.fbSize = targetFramebuffer->m_size;
-    g_pHyprRenderer->m_renderData.transformDamage = false;
-    g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
-    g_pHyprRenderer->draw(CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
+    renderContext().m_data.blockScreenShader = true;
+    renderContext().m_data.fbSize = targetFramebuffer->m_size;
+    renderContext().m_data.transformDamage = false;
+    g_pHyprRenderer->setProjectionType(renderContext(), Render::RPT_EXPORT);
+    g_pHyprRenderer->draw(renderContext(), CClearPassElement::SClearData{.color = CHyprColor{0.05, 0.06, 0.08, 1.0}}, fakeDamage);
     const auto now = Time::steadyNow();
     for (const auto layerKind : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
         for (const auto& layer : Desktop::viewState()->layers()) {
-            if (!layer || !layer->m_mapped || layer->m_noProcess)
+            if (!layer || !layer->mapped() || static_cast<bool>(layer->m_flags & Desktop::View::LAYER_FLAG_DEAD))
                 continue;
             const auto layerMonitor = layer->m_monitor.lock();
             if (!layerMonitor || layerMonitor != monitor || layer->m_layer != static_cast<int>(layerKind))
                 continue;
-            renderLayer(g_pHyprRenderer.get(), layer, monitor, now, false, false);
+            renderLayer(g_pHyprRenderer.get(), renderContext(), layer, monitor, now, false, false, false);
         }
     }
     g_pHyprRenderer->endRender();
-    g_pHyprRenderer->m_renderData.blockScreenShader = previousBlockScreenShader;
+    renderContext().m_data.blockScreenShader = previousBlockScreenShader;
     return "";
 }
 
@@ -14373,7 +14729,7 @@ void OverviewController::refreshWorkspaceStripSnapshots() {
         return;
     }
 
-    if (m_stripSnapshotRenderDepth > 0 || (g_pHyprOpenGL && g_pHyprRenderer->m_renderData.pMonitor)) {
+    if (m_stripSnapshotRenderDepth > 0 || (g_pHyprOpenGL && renderContext().m_data.pMonitor)) {
         m_stripSnapshotsDirty = true;
         scheduleWorkspaceStripSnapshotRefresh();
         return;
@@ -14391,7 +14747,7 @@ void OverviewController::refreshWorkspaceStripSnapshots() {
 }
 
 void OverviewController::armWorkspaceStripRefreshTimer() {
-    const auto interval = getConfigInt(m_handle, "plugin:hymission:workspace_strip_refresh_ms", 500);
+    const auto interval = std::clamp(getConfigInt(m_handle, "plugin:hymission:workspace_strip_refresh_ms", 500), 0L, 60000L);
     if (interval <= 0 || !shouldContinuouslyRefreshWorkspaceStripSnapshots() || m_state.stripEntries.empty())
         return;
 
@@ -14411,8 +14767,9 @@ void OverviewController::scheduleWorkspaceStripSnapshotRefresh() {
         return;
 
     m_stripSnapshotRefreshScheduled = true;
-    g_pEventLoopManager->doLater([this] {
-        if (g_controller != this)
+    const auto generation = inputGeneration;
+    m_idleTasks.post([this, generation] {
+        if (g_controller != this || sessionLocked() || generation != inputGeneration)
             return;
 
         m_stripSnapshotRefreshScheduled = false;
@@ -14428,7 +14785,7 @@ void OverviewController::renderWorkspaceStrip() const {
     if (progress <= 0.0 || m_state.stripEntries.empty())
         return;
 
-    const auto renderMonitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto renderMonitor = renderContext().m_data.pMonitor.lock();
     if (!renderMonitor)
         return;
 
@@ -14444,10 +14801,18 @@ void OverviewController::renderWorkspaceStrip() const {
         }
     }
 
-    const Rect bandGlobal = workspaceStripBandRectForMonitor(renderMonitor, m_state);
-    if (bandGlobal.width > 0.0 && bandGlobal.height > 0.0) {
-        const Rect band = rectToMonitorRenderLocal(animatedWorkspaceStripRect(bandGlobal, renderMonitor), renderMonitor);
-        g_pHyprOpenGL->renderRect(toBox(band), colorWithAlphaMultiplier(workspaceStripBackgroundColor(), progress), {.blur = true, .blurA = 1.0F});
+    auto bandGlobal=workspaceStripBandRectForMonitor(renderMonitor,m_state);
+    auto* tiles=TilesController::get();
+    const bool clustered=tiles && tiles->enabled(renderMonitor);
+    if (clustered) {
+        // A single glass pass also covers the reserved header. Per-column blur
+        // passes sample different backdrops and leave seams at their edges.
+        bandGlobal.y=renderMonitor->m_position.y;
+        bandGlobal.height=renderMonitor->m_size.y;
+    }
+    if (bandGlobal.width>0 && bandGlobal.height>0) {
+        const auto band=rectToMonitorRenderLocal(animatedWorkspaceStripRect(bandGlobal,renderMonitor),renderMonitor);
+        g_pHyprOpenGL->renderRect(renderContext(),toBox(band),colorWithAlphaMultiplier(workspaceStripBackgroundColor(),progress),{.blur=true,.blurA=1.0F});
     }
 
     for (std::size_t index = 0; index < m_state.stripEntries.size(); ++index) {
@@ -14497,14 +14862,19 @@ void OverviewController::renderWorkspaceStrip() const {
             dragDim = m_dropAnimation->initialDim * (1.0 - restored);
         }
 
-        g_pHyprOpenGL->renderRect(toBox(thumbRender), cardColor, {.blur = true, .blurA = 1.0F});
+        g_pHyprOpenGL->renderRect(renderContext(), toBox(thumbRender), cardColor, {.blur = true, .blurA = 1.0F});
 
+        Vector2D cropTL{-1,-1},cropBR{-1,-1};
+        if (entry.tileId && TilesController::get()) for (const auto& view:TilesController::get()->views(renderMonitor)) if (view.id==entry.tileId) {
+            cropTL={(view.allocation.x-renderMonitor->m_position.x)/renderMonitor->m_size.x,(view.allocation.y-renderMonitor->m_position.y)/renderMonitor->m_size.y};
+            cropBR={(view.allocation.x+view.allocation.w-renderMonitor->m_position.x)/renderMonitor->m_size.x,(view.allocation.y+view.allocation.h-renderMonitor->m_position.y)/renderMonitor->m_size.y};
+        }
         if (!entry.newWorkspaceSlot && entry.snapshot && entry.snapshot->framebuffer && entry.snapshot->framebuffer->isAllocated() && entry.snapshot->framebuffer->getTexture()) {
             const bool holdPreDropSnapshot = draggedHoverTarget && entry.snapshot->dropPreview && entry.snapshot->previousFramebuffer &&
                 entry.snapshot->previousFramebuffer->isAllocated() && entry.snapshot->previousFramebuffer->getTexture();
             if (holdPreDropSnapshot) {
-                g_pHyprOpenGL->renderTexture(entry.snapshot->previousFramebuffer->getTexture(), toBox(thumbRender),
-                                             {.a = static_cast<float>(std::clamp(progress, 0.0, 1.0))});
+                g_pHyprOpenGL->renderTexture(renderContext(), entry.snapshot->previousFramebuffer->getTexture(), toBox(thumbRender),
+                                             {.a = static_cast<float>(std::clamp(progress, 0.0, 1.0)), .allowCustomUV=entry.tileId!=0, .primarySurfaceUVTopLeft=cropTL, .primarySurfaceUVBottomRight=cropBR});
             } else {
                 double transition = 1.0;
                 bool transitionAnimating = false;
@@ -14516,21 +14886,21 @@ void OverviewController::renderWorkspaceStrip() const {
                                   static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(STRIP_DROP_ANIMATION_DURATION).count()));
                     transition = raw * raw * (3.0 - 2.0 * raw);
                     transitionAnimating = raw < 1.0;
-                    g_pHyprOpenGL->renderTexture(entry.snapshot->previousFramebuffer->getTexture(), toBox(thumbRender),
-                                                 {.a = static_cast<float>(std::clamp(progress * (1.0 - transition), 0.0, 1.0))});
+                    g_pHyprOpenGL->renderTexture(renderContext(), entry.snapshot->previousFramebuffer->getTexture(), toBox(thumbRender),
+                                                 {.a = static_cast<float>(std::clamp(progress * (1.0 - transition), 0.0, 1.0)), .allowCustomUV=entry.tileId!=0, .primarySurfaceUVTopLeft=cropTL, .primarySurfaceUVBottomRight=cropBR});
                     if (transitionAnimating)
                         g_pHyprRenderer->damageMonitor(renderMonitor);
                 }
-                g_pHyprOpenGL->renderTexture(entry.snapshot->framebuffer->getTexture(), toBox(thumbRender),
-                                             {.a = static_cast<float>(std::clamp(progress * transition, 0.0, 1.0))});
+                g_pHyprOpenGL->renderTexture(renderContext(), entry.snapshot->framebuffer->getTexture(), toBox(thumbRender),
+                                             {.a = static_cast<float>(std::clamp(progress * transition, 0.0, 1.0)), .allowCustomUV=entry.tileId!=0, .primarySurfaceUVTopLeft=cropTL, .primarySurfaceUVBottomRight=cropBR});
             }
         }
 
         if (stateOverlayColor.a > 0.0) {
-            g_pHyprOpenGL->renderRect(toBox(thumbRender), stateOverlayColor, {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(thumbRender), stateOverlayColor, {});
         }
         if (dragDim > 0.001) {
-            g_pHyprOpenGL->renderRect(toBox(thumbRender), CHyprColor(0.0, 0.0, 0.0, STRIP_DRAG_DIM_ALPHA * progress * dragDim), {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(thumbRender), CHyprColor(0.0, 0.0, 0.0, STRIP_DRAG_DIM_ALPHA * progress * dragDim), {});
         }
 
         if (entry.newWorkspaceSlot) {
@@ -14541,8 +14911,8 @@ void OverviewController::renderWorkspaceStrip() const {
             const Rect plusVertical =
                 makeRect(thumb.centerX() - plusThickness * 0.5, thumb.centerY() - plusArmLength * 0.5, plusThickness, plusArmLength);
             const CHyprColor plusColor = colorWithAlphaMultiplier(workspaceStripPlusColor(), progress);
-            g_pHyprOpenGL->renderRect(toBox(scaleRectForRender(plusHorizontal, renderMonitor)), plusColor, {});
-            g_pHyprOpenGL->renderRect(toBox(scaleRectForRender(plusVertical, renderMonitor)), plusColor, {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(scaleRectForRender(plusHorizontal, renderMonitor)), plusColor, {});
+            g_pHyprOpenGL->renderRect(renderContext(), toBox(scaleRectForRender(plusVertical, renderMonitor)), plusColor, {});
         }
     }
 }
@@ -14563,7 +14933,7 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
         if (!monitor)
             return {};
 
-        if (state.collectionPolicy.onlyActiveWorkspace && state.ownerWorkspace && !state.ownerWorkspace->m_isSpecialWorkspace) {
+        if (state.collectionPolicy.onlyActiveWorkspace && state.ownerWorkspace && !(state.ownerWorkspace->type() == Workspace::eWorkspaceType::SPECIAL)) {
             if (const auto ownerMonitor = state.ownerWorkspace->m_monitor.lock(); ownerMonitor == monitor)
                 return state.ownerWorkspace;
         }
@@ -14580,7 +14950,7 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
         const auto allWorkspaces = workspaceStateWorkspaces();
         normalWorkspaces.reserve(allWorkspaces.size());
         for (const auto& workspace : allWorkspaces) {
-            if (!workspace || workspace->m_isSpecialWorkspace)
+            if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
                 continue;
 
             const auto workspaceMonitor = workspace->m_monitor.lock();
@@ -14588,40 +14958,40 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
                 normalWorkspaces.push_back(workspace);
         }
 
-        if (stripActiveWorkspace && !stripActiveWorkspace->m_isSpecialWorkspace && !containsHandle(normalWorkspaces, stripActiveWorkspace))
+        if (stripActiveWorkspace && !(stripActiveWorkspace->type() == Workspace::eWorkspaceType::SPECIAL) && !containsHandle(normalWorkspaces, stripActiveWorkspace))
             normalWorkspaces.push_back(stripActiveWorkspace);
 
         std::stable_sort(normalWorkspaces.begin(), normalWorkspaces.end(), [](const PHLWORKSPACE& lhs, const PHLWORKSPACE& rhs) {
             if (!lhs || !rhs)
                 return static_cast<bool>(lhs);
-            return lhs->m_id < rhs->m_id;
+            return workspaceKey(lhs) < workspaceKey(rhs);
         });
 
-        std::unordered_map<WORKSPACEID, PHLWORKSPACE> normalById;
+        std::unordered_map<WorkspaceKey, PHLWORKSPACE> normalById;
         for (const auto& workspace : normalWorkspaces) {
             if (workspace)
-                normalById.emplace(workspace->m_id, workspace);
+                normalById.emplace(workspaceKey(workspace), workspace);
         }
 
         std::vector<int64_t> workspaceIds;
         workspaceIds.reserve(normalWorkspaces.size());
         for (const auto& workspace : normalWorkspaces) {
             if (workspace)
-                workspaceIds.push_back(workspace->m_id);
+                workspaceIds.push_back(workspaceKey(workspace));
         }
 
         const auto stripWorkspaceIds = expandWorkspaceStripWorkspaceIds(workspaceIds, emptyMode);
 
         std::vector<WorkspaceStripEntry> monitorEntries;
         for (const auto rawWorkspaceId : stripWorkspaceIds) {
-            const auto workspaceId = static_cast<WORKSPACEID>(rawWorkspaceId);
+            const auto workspaceId = static_cast<WorkspaceKey>(rawWorkspaceId);
             const auto it = normalById.find(workspaceId);
             if (it != normalById.end()) {
                 monitorEntries.push_back({
                     .monitor = monitor,
                     .workspace = it->second,
                     .workspaceId = workspaceId,
-                    .workspaceName = it->second->m_name,
+                    .workspaceName = it->second->displayName(),
                     .syntheticEmpty = false,
                     .newWorkspaceSlot = false,
                     .active = stripActiveWorkspace == it->second,
@@ -14639,8 +15009,8 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
             }
         }
 
-        WORKSPACEID nextWorkspaceId = stripWorkspaceIds.empty() ? 1 : static_cast<WORKSPACEID>(std::max<int64_t>(stripWorkspaceIds.back(), 0) + 1);
-        while (::State::workspaceState()->query().id(nextWorkspaceId).run())
+        WorkspaceKey nextWorkspaceId = stripWorkspaceIds.empty() ? 1 : static_cast<WorkspaceKey>(std::max<int64_t>(stripWorkspaceIds.back(), 0) + 1);
+        while (workspaceForKey(nextWorkspaceId))
             ++nextWorkspaceId;
 
         monitorEntries.push_back({
@@ -14656,6 +15026,26 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
         if (monitorEntries.empty())
             continue;
 
+        if (auto* tiles=TilesController::get();tiles && tiles->enabled(monitor)) {
+            for (const auto& view:tiles->views(monitor)) {
+                std::vector<WorkspaceStripEntry> group;
+                for (auto entry:monitorEntries) {
+                    if (entry.workspace && tiles->preferredTile(entry.workspace,monitor)!=view.id) continue;
+                    entry.tileId=view.id; entry.groupFocused=view.focused && Desktop::focusState()->monitor()==monitor;
+                    entry.active=entry.workspace==view.workspace;
+                    group.push_back(std::move(entry));
+                }
+                auto band=tileStripBand(monitor,view.id,state);
+                const double inset=std::min({8.0,band.width/8,band.height/8});
+                std::vector<tiles::Box> slots;
+                const double width=std::max(1.0,band.width-inset*2);
+                const double height=std::min(width*view.allocation.h/std::max(1.0,view.allocation.w),std::max(1.0,(band.height-inset*(group.size()+1))/group.size()));
+                for (size_t i=0;i<group.size();++i) slots.push_back({band.x+inset,band.y+inset+i*(height+inset),width,height});
+                for (size_t i=0;i<slots.size();++i) { const auto& b=slots[i]; group[i].rect={b.x,b.y,b.width,b.height}; }
+                state.stripEntries.insert(state.stripEntries.end(),group.begin(),group.end());
+            }
+            continue;
+        }
         const Rect band = workspaceStripBandRectForMonitor(monitor, state);
         if (niriModeEnabled()) {
             std::optional<std::size_t> activeIndex;
@@ -14726,27 +15116,27 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
     const auto groupPolicy = groupedWindowsPolicy();
     std::unordered_set<Desktop::View::CGroup*> stripGroups;
     for (const auto& window : Desktop::viewState()->windows()) {
-        if (!window || !window->m_isMapped || isWindowFadingOut(window) || window->isHidden())
+        if (!window || !window->mapped() || isWindowFadingOut(window) || window->isHidden())
             continue;
 
         if (!windowHasUsableStateGeometry(window))
             continue;
 
-        if (groupPolicy == GroupedWindowsPolicy::Collapsed && window->m_group) {
-            if (window->m_group->current() != window || !stripGroups.insert(window->m_group.get()).second)
+        if (groupPolicy == GroupedWindowsPolicy::Collapsed && window->grouping().group()) {
+            if (window->grouping().group()->current() != window || !stripGroups.insert(window->grouping().group().get()).second)
                 continue;
         }
 
         const bool useGoalGeometry = shouldUseGoalGeometryForStateSnapshot(window);
         const auto naturalGlobal = stateSnapshotGlobalRectForWindow(window, useGoalGeometry);
-        const auto previewAlpha = overviewPreviewAlphaForWindow(window, static_cast<bool>(window->m_group));
+        const auto previewAlpha = overviewPreviewAlphaForWindow(window, static_cast<bool>(window->grouping().group()));
         const auto targetMonitor = preferredMonitorForWindow(window, state);
 
         for (auto& entry : state.stripEntries) {
             if (!entry.monitor)
                 continue;
 
-            if (window->m_pinned) {
+            if (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED)) {
                 if (entry.monitor == targetMonitor && entry.workspace == activeWorkspaceForStripMonitor(entry.monitor)) {
                     entry.windows.push_back({
                         .window = window,
@@ -14782,9 +15172,68 @@ void OverviewController::buildWorkspaceStripEntries(State& state) const {
     }
 }
 
+struct OverviewController::LayoutIdentityOwners {
+    std::vector<PHLWINDOW> windows;
+    std::vector<SP<Desktop::View::CGroup>> groups;
+    std::vector<SP<Layout::Tiled::SColumnData>> columns;
+};
+
+WindowInput OverviewController::layoutInputForWindow(State& state, const PHLWINDOW& window, const Rect& local, std::size_t index, std::size_t rowGroup) const {
+    WindowInput input{.index = index, .natural = local, .label = window ? window->metadata().title() : "", .rowGroup = rowGroup};
+    if (state.engine != LayoutEngine::Natural || !window)
+        return input;
+
+    // State copies may be used as transition/drag predictions. Detach before
+    // registering owners so even their identity lifetime stays speculative.
+    if (!state.layoutIdentityOwners)
+        state.layoutIdentityOwners = std::make_shared<LayoutIdentityOwners>();
+    else if (!state.layoutIdentityOwners.unique())
+        state.layoutIdentityOwners = std::make_shared<LayoutIdentityOwners>(*state.layoutIdentityOwners);
+    auto& owners = *state.layoutIdentityOwners;
+    const auto group = window->grouping().group();
+    input.stableId = groupedWindowsPolicy() == GroupedWindowsPolicy::Collapsed && group ?
+        keepLayoutIdentity(owners.groups, group) : keepLayoutIdentity(owners.windows, window);
+    const auto workspace = window->m_workspace ? window->m_workspace : state.ownerWorkspace;
+    if (workspace)
+        input.groupId = workspaceKey(workspace);
+    const auto target = window->layoutTarget();
+    input.floating = window->isFloating() || (target && target->floating());
+    if (*input.floating || !target || !workspace || !isScrollingWorkspace(workspace))
+        return input;
+
+    auto* scrolling = scrollingAlgorithmForWorkspace(workspace);
+    if (!scrolling || !scrolling->m_scrollingData)
+        return input;
+    const auto data = scrolling->dataFor(target);
+    const auto column = data ? data->column.lock() : nullptr;
+    if (!column)
+        return input;
+    const auto& columns = scrolling->m_scrollingData->columns;
+    const auto columnIt = std::find(columns.begin(), columns.end(), column);
+    const auto memberIt = std::find(column->targetDatas.begin(), column->targetDatas.end(), data);
+    if (columnIt == columns.end() || memberIt == column->targetDatas.end())
+        return input;
+    const auto nativeColumnIndex = static_cast<std::size_t>(std::distance(columns.begin(), columnIt));
+    // Guard the enum bridge at compile time so an upstream enum change cannot
+    // silently alter the pure direction/index mapping tested offline.
+    static_assert(static_cast<int>(ScrollingLayoutDirection::Right) == Layout::Tiled::SCROLL_DIR_RIGHT);
+    static_assert(static_cast<int>(ScrollingLayoutDirection::Left) == Layout::Tiled::SCROLL_DIR_LEFT);
+    static_assert(static_cast<int>(ScrollingLayoutDirection::Down) == Layout::Tiled::SCROLL_DIR_DOWN);
+    static_assert(static_cast<int>(ScrollingLayoutDirection::Up) == Layout::Tiled::SCROLL_DIR_UP);
+    const auto geometry = scrollingColumnGeometry(nativeColumnIndex, columns.size(),
+                                                  static_cast<ScrollingLayoutDirection>(scrolling->getDynamicDirection()));
+    if (!geometry)
+        return input;
+    input.columnId = keepLayoutIdentity(owners.columns, column);
+    input.columnIndex = geometry->columnIndex;
+    input.columnAxis = geometry->columnAxis;
+    input.columnMemberIndex = static_cast<std::size_t>(std::distance(column->targetDatas.begin(), memberIt));
+    return input;
+}
+
 OverviewController::State OverviewController::buildState(const PHLMONITOR& monitor, ScopeOverride requestedScope, const std::vector<WorkspaceOverride>& workspaceOverrides,
                                                          bool keepEmptyParticipatingMonitors, bool suppressWorkspaceStrip,
-                                                         PHLWINDOW preferredSelectedWindow) const {
+                                                         PHLWINDOW preferredSelectedWindow, const State* previousLayoutState) const {
     State state;
     if (!monitor || !monitor->m_activeWorkspace)
         return state;
@@ -14832,17 +15281,24 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
                 continue;
 
             if (const auto* override = overrideForMonitor(candidateMonitor); override) {
-                if (override->workspace)
+                if (auto* tiles=TilesController::get();override->tileId && tiles && tiles->enabled(candidateMonitor)) {
+                    // A tile transition replaces one desktop, preserving the
+                    // other tiles in both source and destination scenes.
+                    for (const auto& view:tiles->views(candidateMonitor))
+                        addWorkspace(view.id==override->tileId?override->workspace:view.workspace);
+                } else if (override->workspace)
                     addWorkspace(override->workspace);
                 continue;
             }
 
-            if (candidateMonitor->m_activeWorkspace)
+            if (auto* tiles=TilesController::get();state.collectionPolicy.onlyActiveWorkspace && tiles && tiles->enabled(candidateMonitor)) {
+                for (const auto& view:tiles->views(candidateMonitor)) addWorkspace(view.workspace);
+            } else if (candidateMonitor->m_activeWorkspace)
                 addWorkspace(candidateMonitor->m_activeWorkspace);
         }
     } else {
         for (const auto& workspace : workspaceStateWorkspaces()) {
-            if (!workspace || workspace->m_isSpecialWorkspace)
+            if (!workspace || (workspace->type() == Workspace::eWorkspaceType::SPECIAL))
                 continue;
 
             const auto workspaceMonitor = workspace->m_monitor.lock();
@@ -14863,10 +15319,10 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
             if (!lhs || !rhs)
                 return static_cast<bool>(lhs);
 
-            if (lhs->m_isSpecialWorkspace != rhs->m_isSpecialWorkspace)
-                return !lhs->m_isSpecialWorkspace;
+            if ((lhs->type() == Workspace::eWorkspaceType::SPECIAL) != (rhs->type() == Workspace::eWorkspaceType::SPECIAL))
+                return !(lhs->type() == Workspace::eWorkspaceType::SPECIAL);
 
-            return lhs->m_id < rhs->m_id;
+            return workspaceKey(lhs) < workspaceKey(rhs);
         });
     }
 
@@ -14885,7 +15341,7 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
 
         if (!backup.originalFullscreenWindow || backup.originalFullscreenMode == FSMODE_NONE) {
             for (const auto& window : Desktop::viewState()->windows()) {
-                if (!window || !window->m_isMapped || window->m_workspace != workspace || Fullscreen::controller()->getFullscreenModes(window).internal == FSMODE_NONE)
+                if (!window || !window->mapped() || window->m_workspace != workspace || Fullscreen::controller()->getFullscreenModes(window).internal == FSMODE_NONE)
                     continue;
 
                 backup.originalFullscreenWindow = window;
@@ -14909,10 +15365,10 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
     };
 
     for (const auto& workspace : state.managedWorkspaces) {
-        if (!workspace || !workspace->m_space)
+        if (!workspace || !workspace->space())
             continue;
 
-        for (const auto& targetRef : workspace->m_space->targets()) {
+        for (const auto& targetRef : workspace->space()->targets()) {
             const auto target = targetRef.lock();
             if (!target)
                 continue;
@@ -14967,8 +15423,8 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
         }
 
         std::stable_sort(candidates.begin(), candidates.end(), [&](const PHLWINDOW& lhs, const PHLWINDOW& rhs) {
-            const void* lhsKey = groupPolicy == GroupedWindowsPolicy::Collapsed && lhs && lhs->m_group ? static_cast<const void*>(lhs->m_group.get()) : static_cast<const void*>(lhs.get());
-            const void* rhsKey = groupPolicy == GroupedWindowsPolicy::Collapsed && rhs && rhs->m_group ? static_cast<const void*>(rhs->m_group.get()) : static_cast<const void*>(rhs.get());
+            const void* lhsKey = groupPolicy == GroupedWindowsPolicy::Collapsed && lhs && lhs->grouping().group() ? static_cast<const void*>(lhs->grouping().group().get()) : static_cast<const void*>(lhs.get());
+            const void* rhsKey = groupPolicy == GroupedWindowsPolicy::Collapsed && rhs && rhs->grouping().group() ? static_cast<const void*>(rhs->grouping().group().get()) : static_cast<const void*>(rhs.get());
             const auto lhsIt = previousOrder.find(lhsKey);
             const auto rhsIt = previousOrder.find(rhsKey);
             const bool lhsKnown = lhsIt != previousOrder.end();
@@ -15006,11 +15462,19 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
     std::unordered_map<MONITORID, std::size_t> directNiriOverviewWindowsByMonitor;
     LayoutConfig config = layoutConfigForState(state);
     state.engine = config.engine;
+    if (config.engine == LayoutEngine::Natural && previousLayoutState && previousLayoutState->engine == config.engine &&
+        previousLayoutState->ownerMonitor == state.ownerMonitor &&
+        previousLayoutState->collectionPolicy.requestedScope == state.collectionPolicy.requestedScope &&
+        previousLayoutState->collectionPolicy.onlyActiveMonitor == state.collectionPolicy.onlyActiveMonitor &&
+        previousLayoutState->collectionPolicy.onlyActiveWorkspace == state.collectionPolicy.onlyActiveWorkspace &&
+        previousLayoutState->collectionPolicy.includeSpecial == state.collectionPolicy.includeSpecial) {
+        state.layoutSession = previousLayoutState->layoutSession;
+        state.layoutIdentityOwners = previousLayoutState->layoutIdentityOwners;
+    }
     const bool useWorkspaceRows = workspaceRowsEnabled(m_handle) || config.engine == LayoutEngine::Thumbnail;
     config.preserveInputOrder = preserveExistingOrder || orderByRecentUse;
     config.forceRowGroups = useWorkspaceRows;
-    config.rankScaleByInputOrder = orderByRecentUse;
-    const bool allowDirectNiriOverviewLayout = state.collectionPolicy.onlyActiveWorkspace;
+    const bool allowDirectNiriOverviewLayout = state.collectionPolicy.onlyActiveWorkspace && config.engine != LayoutEngine::Natural;
     const auto slotWithBorderOuterTarget = [&](const PHLWINDOW& window, const PHLMONITOR& monitor, WindowSlot slot) {
         if (!monitor)
             return slot;
@@ -15046,7 +15510,7 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
         if (state.collectionPolicy.requestedScope == ScopeOverride::ForceAll)
             return std::nullopt;
 
-        if (!niriModeEnabled() || !window || !targetMonitor || (window->m_pinned && !allowPinned) || !window->m_workspace || !window->m_workspace->m_space ||
+        if (!niriModeEnabled() || !window || !targetMonitor || (static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED) && !allowPinned) || !window->m_workspace || !window->m_workspace->space() ||
             !isScrollingWorkspace(window->m_workspace))
             return std::nullopt;
 
@@ -15112,7 +15576,7 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
             baseGlobal = rowGeometry->baseGlobal;
             overflowAxis = rowGeometry->primaryAxis;
         } else {
-            const CBox workAreaBox = window && window->m_workspace && window->m_workspace->m_space ? window->m_workspace->m_space->workArea() : CBox{};
+            const CBox workAreaBox = window && window->m_workspace && window->m_workspace->space() ? window->m_workspace->space()->workArea() : CBox{};
             baseGlobal = makeRect(workAreaBox.x, workAreaBox.y, workAreaBox.width, workAreaBox.height);
         }
 
@@ -15127,8 +15591,8 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
 
     std::unordered_set<Desktop::View::CGroup*> collapsedGroups;
     for (const auto& window : candidates) {
-        if (groupPolicy == GroupedWindowsPolicy::Collapsed && window && window->m_group) {
-            if (window->m_group->current() != window || !collapsedGroups.insert(window->m_group.get()).second)
+        if (groupPolicy == GroupedWindowsPolicy::Collapsed && window && window->grouping().group()) {
+            if (window->grouping().group()->current() != window || !collapsedGroups.insert(window->grouping().group().get()).second)
                 continue;
         }
 
@@ -15137,8 +15601,8 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
 
         if (m_searchActive && !m_searchNormalizedQuery.empty()) {
             bool matches = windowMatchesActiveSearch(window);
-            if (!matches && groupPolicy == GroupedWindowsPolicy::Collapsed && window && window->m_group) {
-                matches = std::ranges::any_of(window->m_group->windows(), [&](const PHLWINDOWREF& memberRef) {
+            if (!matches && groupPolicy == GroupedWindowsPolicy::Collapsed && window && window->grouping().group()) {
+                matches = std::ranges::any_of(window->grouping().group()->windows(), [&](const PHLWINDOWREF& memberRef) {
                     return windowMatchesActiveSearch(memberRef.lock());
                 });
             }
@@ -15158,6 +15622,7 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
         std::optional<WindowSlot> directNiriSlot;
         bool directNiriFloatingOverlay = false;
 
+        if (!TilesController::get() || !TilesController::get()->enabled(targetMonitor)) {
         const Rect floatingSourceGlobal = floatingOverviewSourceGlobalRectForWindow(window, renderGlobalRectForWindow(window, useGoalGeometry));
         directNiriSlot = niriFloatingOverviewSlotForWindow(window, targetMonitor, floatingSourceGlobal, windowIndex);
         if (directNiriSlot) {
@@ -15171,20 +15636,22 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
                 directNiriSourceGlobal = resolvedScrollingSourceGlobal;
         }
 
+        }
+
         state.windows.push_back({
             .window = window,
             .targetMonitor = targetMonitor,
-            .title = window->m_title,
+            .title = window->metadata().title(),
             .naturalGlobal = directNiriSlot ? directNiriSourceGlobal : naturalGlobal,
             .exitGlobal = directNiriSlot ? directNiriSourceGlobal : naturalGlobal,
-            .previewAlpha = overviewPreviewAlphaForWindow(window, static_cast<bool>(window->m_group)),
-            .isFloating = window->m_isFloating,
-            .isPinned = window->m_pinned,
+            .previewAlphaWithoutActive = overviewPreviewAlphaForWindow(window, static_cast<bool>(window->grouping().group()), true),
+            .isFloating = window->isFloating(),
+            .isPinned = static_cast<bool>(window->m_state & Desktop::View::WINDOW_STATE_PINNED),
             .isNiriFloatingOverlay = directNiriFloatingOverlay,
-            .group = window->m_group,
-            .groupMembers = window->m_group ? window->m_group->windows() : std::vector<PHLWINDOWREF>{},
-            .groupCurrentIndex = window->m_group ? window->m_group->getCurrentIdx() : 0,
-            .collapsedGroup = groupPolicy == GroupedWindowsPolicy::Collapsed && static_cast<bool>(window->m_group),
+            .group = window->grouping().group(),
+            .groupMembers = window->grouping().group() ? window->grouping().group()->windows() : std::vector<PHLWINDOWREF>{},
+            .groupCurrentIndex = window->grouping().group() ? window->grouping().group()->getCurrentIdx() : 0,
+            .collapsedGroup = groupPolicy == GroupedWindowsPolicy::Collapsed && static_cast<bool>(window->grouping().group()),
         });
 
         if (directNiriSlot) {
@@ -15198,7 +15665,7 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
                 std::ostringstream out;
                 out << "[hymission] niri " << (directNiriFloatingOverlay ? "floating overview overlay" : "scrolling overview direct")
                     << " window=" << debugWindowLabel(window)
-                    << " floating=" << (window->m_isFloating ? 1 : 0)
+                    << " floating=" << (window->isFloating() ? 1 : 0)
                     << " source=" << rectToString(directNiriSourceGlobal)
                     << " target=" << rectToString(managed.targetGlobal)
                     << " scale=" << directNiriSlot->scale;
@@ -15208,26 +15675,20 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
         }
 
         const Rect layoutOuterGlobal = overviewBorderOuterRectForWindow(window, layoutGlobal);
-        inputsByMonitor[targetMonitor->m_id].push_back({
-            .index = windowIndex,
-            .natural =
+        // Expansion is applied after the stable base layout is computed.
+        // Selection changes must not enlarge a reserved base slot.
+        inputsByMonitor[targetMonitor->m_id].push_back(layoutInputForWindow(state, window,
                 {
                     layoutOuterGlobal.x - targetMonitor->m_position.x,
                     layoutOuterGlobal.y - targetMonitor->m_position.y,
                     layoutOuterGlobal.width,
                     layoutOuterGlobal.height,
-                },
-            .label = window->m_title,
-            .rowGroup = rowGroupForWindow(window),
-            // Expansion is applied after the stable base layout is computed.
-            // Keeping slots un-emphasized prevents the initial selection from
-            // remaining enlarged after selection moves elsewhere.
-            .layoutEmphasis = 1.0,
-        });
+                }, windowIndex, rowGroupForWindow(window)));
     }
 
     std::vector<PHLMONITOR> activeParticipatingMonitors;
-    MissionControlLayout engine;
+    std::vector<OverviewLayoutRegion> layoutRegions;
+    const std::vector<WindowInput> emptyInputs;
     for (const auto& candidateMonitor : state.participatingMonitors) {
         if (!candidateMonitor)
             continue;
@@ -15241,14 +15702,34 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
             continue;
 
         activeParticipatingMonitors.push_back(candidateMonitor);
-        if (inputsIt == inputsByMonitor.end() || inputsIt->second.empty())
-            continue;
+        const auto& monitorInputs = inputsIt == inputsByMonitor.end() ? emptyInputs : inputsIt->second;
 
+        const auto computeRegion = [&](const std::vector<WindowInput>& inputs, const Rect& area, uint64_t tile, const PHLWORKSPACE& workspace) {
+            const OverviewLayoutRegion region{static_cast<std::int64_t>(candidateMonitor->m_id), tile,
+                state.collectionPolicy.onlyActiveWorkspace && workspace ? std::optional<std::int64_t>(workspaceKey(workspace)) : std::nullopt};
+            layoutRegions.push_back(region);
+            return state.layoutSession.compute(region, inputs, area, config);
+        };
+
+        if (auto* tiles=TilesController::get();state.collectionPolicy.onlyActiveWorkspace && tiles && tiles->enabled(candidateMonitor)) {
+            for (const auto& view:tiles->views(candidateMonitor)) {
+                std::vector<WindowInput> inputs;
+                for (const auto& input:monitorInputs) if (input.index<state.windows.size() && tiles->preferredTile(state.windows[input.index].window->m_workspace,candidateMonitor)==view.id) inputs.push_back(input);
+                const auto* override = overrideForMonitor(candidateMonitor);
+                const auto workspace = override && override->tileId == view.id ? override->workspace : view.workspace;
+                const auto slots=computeRegion(inputs,tileContentRect(candidateMonitor,view.id,state),view.id,workspace);
+                for (const auto& slot:slots) if (slot.index<state.windows.size()) {
+                    auto& managed=state.windows[slot.index]; managed.slot=slot;
+                    managed.targetGlobal=overviewContentTargetForSlot(managed.window,candidateMonitor,slot);
+                    managed.relayoutFromGlobal=managed.targetGlobal; state.slots.push_back(slot);
+                }
+            }
+            continue;
+        }
         const Rect previewArea = overviewContentRectForMonitor(candidateMonitor, state);
-        const auto slots =
-            engine.compute(inputsIt->second,
-                           previewArea,
-                           config);
+        const auto* override = overrideForMonitor(candidateMonitor);
+        const auto workspace = override ? override->workspace : candidateMonitor->m_activeWorkspace;
+        const auto slots = computeRegion(monitorInputs, previewArea, 0, workspace);
         for (const auto& slot : slots) {
             if (slot.index >= state.windows.size())
                 continue;
@@ -15263,6 +15744,8 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
             state.slots.push_back(slot);
         }
     }
+
+    state.layoutSession.retainRegions(layoutRegions);
 
     const auto settleNiriFloatingOverlayOverlaps = [&]() {
         const double gap = std::max(2.0, std::min(12.0, std::min(config.columnSpacing, config.rowSpacing) * 0.25));
@@ -15512,6 +15995,17 @@ OverviewController::State OverviewController::buildState(const PHLMONITOR& monit
 
     state.participatingMonitors = std::move(activeParticipatingMonitors);
     buildWorkspaceStripEntries(state);
+    if (auto* tiles = TilesController::get()) {
+        for (const auto& candidate : state.participatingMonitors) {
+            if (!tiles->enabled(candidate))
+                continue;
+            const auto* override = overrideForMonitor(candidate);
+            for (const auto& view : tiles->views(candidate)) {
+                const auto workspace = override && override->tileId == view.id ? override->workspace : view.workspace;
+                state.tileLayouts.push_back({candidate, view.id, workspace, tileContentRect(candidate, view.id, state)});
+            }
+        }
+    }
     applyOffscreenOpenAnimationEndpoints(state);
 
     const auto selectionTarget = preferredSelectedWindow ? preferredSelectedWindow : focusedWindow;
