@@ -979,6 +979,9 @@ class OverviewController {
     EffectiveAlphaFn          m_effectiveAlphaOriginal = nullptr;
     RendererDrawElementFn     m_rendererDrawElementOriginal = nullptr;
     RenderLayerFn             m_renderLayerOriginal = nullptr;
+    // Patched native entry. Another plugin (HyprGlass) may own the renderLayer
+    // hook; wallpaper snapshots then still render through its chain.
+    RenderLayerFn             m_renderLayerSource = nullptr;
     BorderDrawFn              m_borderDrawOriginal = nullptr;
     BorderDrawFn              m_shadowDrawOriginal = nullptr;
     BorderDrawFn              m_groupBarDrawOriginal = nullptr;

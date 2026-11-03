@@ -7870,6 +7870,7 @@ bool OverviewController::installHooks() {
         return initFailed("[hymission] failed to hook CWindow::effectiveAlpha for expanded groups");
     }
 
+    m_renderLayerSource = reinterpret_cast<RenderLayerFn>(findFunction("renderLayer", std::vector<std::string>{"IHyprRenderer::renderLayer(", "CHyprRenderer::renderLayer("}));
     (void)hookFunction("renderLayer", std::vector<std::string>{"IHyprRenderer::renderLayer(", "CHyprRenderer::renderLayer("}, m_renderLayerHook,
                        hooks::target(&hkRenderLayer));
 
@@ -14496,7 +14497,8 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
     };
 
     const auto renderBackgroundLayers = [&](const Time::steady_tp& now) {
-        if (!m_renderLayerOriginal)
+        const auto renderLayer = m_renderLayerOriginal ? m_renderLayerOriginal : m_renderLayerSource;
+        if (!renderLayer)
             return;
 
         for (const auto layerKind : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
@@ -14508,7 +14510,7 @@ void OverviewController::renderWorkspaceStripSnapshot(WorkspaceStripEntry& entry
                 if (!layerMonitor || layerMonitor != monitor || layer->m_layer != static_cast<int>(layerKind))
                     continue;
 
-                m_renderLayerOriginal(g_pHyprRenderer.get(), renderContext(), layer, monitor, now, false, false, false);
+                renderLayer(g_pHyprRenderer.get(), renderContext(), layer, monitor, now, false, false, false);
             }
         }
     };
@@ -14677,16 +14679,22 @@ std::string OverviewController::renderBackgroundIntoFramebuffer(const PHLMONITOR
         return "overview controller missing";
     // The renderLayer hook activates with the overview; activate it on demand
     // so the persistent stage sidebar can render wallpapers before that.
-    if (!g_controller->m_renderLayerOriginal) {
-        if (!g_controller->m_renderLayerHook || !g_controller->m_renderLayerHook->hook())
-            return "renderLayer hook unavailable";
-        g_controller->m_renderLayerOriginal = reinterpret_cast<RenderLayerFn>(g_controller->m_renderLayerHook->m_original);
+    if (!g_controller->m_renderLayerOriginal && g_controller->m_renderLayerHook) {
+        if (g_controller->m_renderLayerHook->hook()) {
+            g_controller->m_renderLayerOriginal = reinterpret_cast<RenderLayerFn>(g_controller->m_renderLayerHook->m_original);
+        } else {
+            // Owned by another plugin; do not retry (and log) on every refresh.
+            hooks::remove(g_controller->m_handle, g_controller->m_renderLayerHook);
+            g_controller->m_renderLayerHook = nullptr;
+        }
     }
+    const auto renderLayer = g_controller->m_renderLayerOriginal ? g_controller->m_renderLayerOriginal : g_controller->m_renderLayerSource;
+    if (!renderLayer)
+        return "renderLayer unavailable";
     if (!targetFramebuffer)
         return "no target framebuffer";
     if (!g_pHyprRenderer || !g_pHyprOpenGL || !monitor)
         return "renderer unavailable";
-    const auto renderLayer = g_controller->m_renderLayerOriginal;
     const int width  = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.x)));
     const int height = std::max(1, static_cast<int>(std::lround(monitor->m_transformedSize.y)));
     targetFramebuffer->setImageDescription(monitor->workBufferImageDescription());
